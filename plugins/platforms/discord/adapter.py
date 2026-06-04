@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -584,6 +584,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
+        # Bot-to-bot loop protection: per-channel rolling window of timestamps
+        # for messages accepted from BOT authors (DISCORD_ALLOW_BOTS). Caps how
+        # many bot-triggered turns happen in a channel within a short window so
+        # two bots that @mention each other self-extinguish instead of looping.
+        self._bot_loop_buckets: Dict[int, deque] = defaultdict(deque)
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
@@ -752,6 +757,26 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_message(message: DiscordMessage):
+                # TEMP DIAGNOSTIC (env-gated): confirm event delivery + author/bot/mentions
+                if os.getenv("DISCORD_DEBUG_INBOUND"):
+                    try:
+                        _selfu = getattr(self._client, "user", None)
+                        logger.info(
+                            "[Discord][DEBUG] on_message ch=%s author=%s id=%s bot=%s mentions=%s self=%s self_in_mentions=%s ALLOW_BOTS=%r ALLOW_CH=%r ALLOW_IDS_len=%s content=%r",
+                            getattr(message.channel, "id", None),
+                            getattr(message.author, "name", None),
+                            getattr(message.author, "id", None),
+                            getattr(message.author, "bot", None),
+                            [getattr(u, "id", None) for u in getattr(message, "mentions", [])],
+                            getattr(_selfu, "id", None),
+                            (_selfu in getattr(message, "mentions", [])) if _selfu else None,
+                            os.getenv("DISCORD_ALLOW_BOTS"),
+                            os.getenv("DISCORD_ALLOW_BOTS_CHANNELS"),
+                            len(self._parse_id_csv(os.getenv("DISCORD_ALLOW_BOTS_IDS", ""))),
+                            (getattr(message, "content", "") or "")[:60],
+                        )
+                    except Exception as _e:
+                        logger.info("[Discord][DEBUG] on_message logging error: %r", _e)
                 # Block until _resolve_allowed_usernames has swapped
                 # any raw usernames in DISCORD_ALLOWED_USERS for numeric
                 # IDs (otherwise on_message's author.id lookup can miss).
@@ -785,10 +810,48 @@ class DiscordAdapter(BasePlatformAdapter):
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
                         return
-                    elif allow_bots == "mentions":
+                    # Channel-scoping: when DISCORD_ALLOW_BOTS_CHANNELS is set
+                    # (comma-separated channel IDs, e.g. #agent-command-center),
+                    # bot authors are honored ONLY in those channels. Everywhere
+                    # else (home channels, etc.) bots are ignored regardless of
+                    # DISCORD_ALLOW_BOTS, so bot-to-bot chatter can never leak
+                    # outside the one channel it's intended for. Empty/unset =
+                    # no channel restriction (back-compat).
+                    _allow_bots_channels = self._parse_id_csv(
+                        os.getenv("DISCORD_ALLOW_BOTS_CHANNELS", "")
+                    )
+                    if _allow_bots_channels:
+                        _ch_id = getattr(message.channel, "id", None)
+                        _parent_id = getattr(message.channel, "parent_id", None)
+                        if (_ch_id not in _allow_bots_channels
+                                and _parent_id not in _allow_bots_channels):
+                            return
+                    # Explicit known-bot allow-list: when DISCORD_ALLOW_BOTS_IDS
+                    # is set (comma-separated bot user IDs of the command-center
+                    # bots — Pryor/dispatch, Stark, Alfred, Dave, Katt, Bernie,
+                    # Redd, Martin, Letterman, Clawry), ONLY those bots may
+                    # trigger us. An unknown/rogue bot that wanders into the
+                    # channel is dropped even if it @mentions us, so we never
+                    # answer to anything outside the roster. Empty/unset = no ID
+                    # restriction (any bot honored, back-compat).
+                    _allow_bots_ids = self._parse_id_csv(
+                        os.getenv("DISCORD_ALLOW_BOTS_IDS", "")
+                    )
+                    if (_allow_bots_ids
+                            and getattr(message.author, "id", None)
+                            not in _allow_bots_ids):
+                        return
+                    if allow_bots == "mentions":
                         if not self._client.user or self._client.user not in message.mentions:
                             return
-                    # "all" falls through; bot is permitted — skip the
+                    # Loop protection: rolling-window cap on how many bot-
+                    # triggered messages this gateway will accept per channel,
+                    # so two bots that @mention each other can exchange a few
+                    # turns then go quiet instead of ping-ponging forever and
+                    # burning tokens. (Self-messages are already dropped above.)
+                    if not self._bot_loop_guard_ok(message):
+                        return
+                    # "all"/"mentions" passed; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
                 else:
                     # Non-bot: enforce the configured user/role allowlists.
@@ -932,6 +995,60 @@ class DiscordAdapter(BasePlatformAdapter):
         self._release_platform_lock()
 
         logger.info("[%s] Disconnected", self.name)
+
+    @staticmethod
+    def _parse_id_csv(raw: str) -> set:
+        """Parse a comma-separated list of integer IDs into a set[int].
+        Tolerates whitespace, blanks, and non-numeric junk (skipped)."""
+        out: set = set()
+        for piece in (raw or "").replace(";", ",").split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                out.add(int(piece))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _bot_loop_guard_ok(self, message) -> bool:
+        """Rolling-window cap on messages accepted from BOT authors, per
+        channel. Returns True if this bot-triggered message is within budget
+        (and records it); False if the channel has hit the cap and the message
+        should be dropped. Two bots @mentioning each other thus get a few turns
+        then go quiet, instead of looping forever and burning tokens.
+
+        Tunables (env):
+          DISCORD_BOT_LOOP_MAX_HOPS        — max bot-triggered msgs per window
+                                             per channel (default 4; <=0 blocks
+                                             all bot messages).
+          DISCORD_BOT_LOOP_WINDOW_SECONDS  — rolling window length (default 60).
+        """
+        try:
+            max_hops = int(os.getenv("DISCORD_BOT_LOOP_MAX_HOPS", "4"))
+        except (TypeError, ValueError):
+            max_hops = 4
+        try:
+            window = float(os.getenv("DISCORD_BOT_LOOP_WINDOW_SECONDS", "60"))
+        except (TypeError, ValueError):
+            window = 60.0
+        if max_hops <= 0:
+            return False
+        ch_id = getattr(message.channel, "id", 0)
+        now = time.monotonic()
+        bucket = self._bot_loop_buckets[ch_id]
+        while bucket and (now - bucket[0]) > window:
+            bucket.popleft()
+        if len(bucket) >= max_hops:
+            logger.warning(
+                "[Discord] bot-loop guard tripped in channel %s: %d bot-"
+                "triggered messages within %.0fs; dropping further bot "
+                "messages until the window clears.",
+                ch_id, len(bucket), window,
+            )
+            return False
+        bucket.append(now)
+        return True
 
     def _command_sync_state_path(self) -> _Path:
         from hermes_constants import get_hermes_home
