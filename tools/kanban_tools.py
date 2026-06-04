@@ -1022,10 +1022,14 @@ KANBAN_COMPLETE_SCHEMA = {
             "result": {
                 "type": "string",
                 "description": (
-                    "Short result log line (legacy field, maps to "
-                    "task.result). Use ``summary`` instead when "
-                    "possible; this exists for compatibility with "
-                    "callers that still set --result on the CLI."
+                    "The full deliverable — your actual work product. "
+                    "For content/research/analysis tasks (answers, "
+                    "reports, findings, writeups), put the complete "
+                    "output here. ``summary`` is the 1-3 sentence "
+                    "handoff line; ``result`` is the payload "
+                    "downstream consumers read. For coding tasks "
+                    "where the deliverable is files on disk, omit "
+                    "this — the files speak for themselves."
                 ),
             },
             "created_cards": {
