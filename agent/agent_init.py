@@ -86,6 +86,38 @@ def _build_codex_gpt55_autoraise_notice(autoraise: Dict[str, float]) -> str:
     )
 
 
+# Local patch (Mac mini, 2026-06-09): the autoraise notice above was designed
+# as "one-time" but the notified state only lived on the agent instance
+# (``_compression_warning``), so every fresh agent init — each new gateway
+# session, each ``hermes`` CLI invocation — re-emitted it. Persist the
+# notified state as a marker file in HERMES_HOME so the notice fires at most
+# once per profile, ever. The 85% autoraise behavior itself is unchanged.
+_CODEX_GPT55_NOTICE_MARKER = ".codex_gpt55_autoraise_notified"
+
+
+def _codex_gpt55_autoraise_already_notified() -> bool:
+    """True if this HERMES_HOME has already shown the autoraise notice."""
+    try:
+        from hermes_constants import get_hermes_home
+        return (get_hermes_home() / _CODEX_GPT55_NOTICE_MARKER).exists()
+    except Exception:
+        return False
+
+
+def _mark_codex_gpt55_autoraise_notified() -> None:
+    """Persist the notified flag; best-effort, never raises."""
+    try:
+        from hermes_constants import get_hermes_home
+        import time
+        marker = get_hermes_home() / _CODEX_GPT55_NOTICE_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def _normalized_custom_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -1682,8 +1714,13 @@ def init_agent(
         # gateway users get the same text replayed via _compression_warning on
         # turn 1 (set below, after the warning slot is initialized).
         _autoraise = getattr(agent, "_compression_threshold_autoraised", None)
-        if _autoraise and compression_enabled:
+        if (
+            _autoraise
+            and compression_enabled
+            and not _codex_gpt55_autoraise_already_notified()
+        ):
             print(_build_codex_gpt55_autoraise_notice(_autoraise))
+            _mark_codex_gpt55_autoraise_notified()
 
     # Check immediately so CLI users see the warning at startup.
     # Gateway status_callback is not yet wired, so any warning is stored
@@ -1693,8 +1730,13 @@ def init_agent(
     # above only reaches the CLI, so stash the same text here to be replayed
     # through status_callback on the first turn (Telegram/Discord/Slack/etc.).
     _autoraise = getattr(agent, "_compression_threshold_autoraised", None)
-    if _autoraise and compression_enabled:
+    if (
+        _autoraise
+        and compression_enabled
+        and not _codex_gpt55_autoraise_already_notified()
+    ):
         agent._compression_warning = _build_codex_gpt55_autoraise_notice(_autoraise)
+        _mark_codex_gpt55_autoraise_notified()
     # Lazy feasibility check: deferred to the first turn that approaches the
     # compression threshold. Running it eagerly here costs ~400ms cold (network
     # probe of the auxiliary provider chain + /models lookup) on every agent
