@@ -6935,6 +6935,10 @@ async def _standalone_send(
 
             if is_forum:
                 thread_name = _derive_forum_thread_name(message)
+
+                from gateway.platforms.base import BasePlatformAdapter
+                chunks = BasePlatformAdapter.truncate_message(message, 2000)
+
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
 
                 # Filter to readable media files up front so we can pick the
@@ -6948,6 +6952,8 @@ async def _standalone_send(
                         continue
                     valid_media.append(media_path)
 
+                starter_content = chunks[0] if chunks else thread_name
+
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), **_sess_kw) as session:
                     if valid_media:
                         # Multipart: payload_json + files[N] creates a forum
@@ -6957,7 +6963,7 @@ async def _standalone_send(
                             {"id": str(idx), "filename": os.path.basename(path)}
                             for idx, path in enumerate(valid_media)
                         ]
-                        starter_message = {"content": message, "attachments": attachments_meta}
+                        starter_message = {"content": starter_content, "attachments": attachments_meta}
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
                         form = aiohttp.FormData()
@@ -6986,7 +6992,7 @@ async def _standalone_send(
                             headers=json_headers,
                             json={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": {"content": starter_content},
                             },
                             **_req_kw,
                         ) as resp:
@@ -6997,6 +7003,29 @@ async def _standalone_send(
 
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
+
+                # Send remaining chunks into the newly created thread.
+                followup_warnings: list[str] = []
+                for chunk in chunks[1:]:
+                    try:
+                        followup_url = f"https://discord.com/api/v10/channels/{thread_id_created}/messages"
+                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as fsession:
+                            async with fsession.post(
+                                followup_url, headers=json_headers, json={"content": chunk}, **_req_kw
+                            ) as fresp:
+                                if fresp.status not in {200, 201}:
+                                    fbody = await fresp.text()
+                                    fwarning = _standalone_sanitize_error(
+                                        f"Forum follow-up chunk failed ({fresp.status}): {fbody}"
+                                    )
+                                    logger.warning(fwarning)
+                                    followup_warnings.append(fwarning)
+                    except Exception as fe:
+                        fwarning = _standalone_sanitize_error(f"Forum follow-up chunk error: {fe}")
+                        logger.warning(fwarning)
+                        followup_warnings.append(fwarning)
+                if followup_warnings:
+                    warnings.extend(followup_warnings)
                 result = {
                     "success": True,
                     "platform": "discord",
@@ -7010,14 +7039,20 @@ async def _standalone_send(
 
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
 
+        from gateway.platforms.base import BasePlatformAdapter
+
+        # Chunk long messages so they never exceed Discord's 2000-char limit.
+        chunks = BasePlatformAdapter.truncate_message(message, 2000)
+
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in {200, 201}:
-                        body = await resp.text()
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
-                    last_data = await resp.json()
+                for chunk in chunks:
+                    async with session.post(url, headers=json_headers, json={"content": chunk}, **_req_kw) as resp:
+                        if resp.status not in {200, 201}:
+                            body = await resp.text()
+                            return {"error": f"Discord API error ({resp.status}): {body}"}
+                        last_data = await resp.json()
 
             # Send each media file as a separate multipart upload
             for media_path, _is_voice in media_files:
