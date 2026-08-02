@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import review_gate
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -4903,6 +4904,51 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Verification gate: high-risk work does not go straight to done. It goes
+    # to the review lane, reassigned to a different profile, and the existing
+    # dispatcher spawns an independent reviewer on its next tick. Returning
+    # True keeps the worker's own exit path clean — from its side the task is
+    # handed off, not failed. See hermes_cli/review_gate.py.
+    _gate_needed, _gate_plan = review_gate.evaluate(conn, task_id)
+    if _gate_needed:
+        _gated = False
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       assignee      = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                """,
+                (_gate_plan["reviewer"], task_id),
+            )
+            if cur.rowcount == 1:
+                _gate_summary = (summary if summary is not None else result) or ""
+                _end_run(
+                    conn, task_id,
+                    outcome="completed", status="done",
+                    summary=_gate_summary or None,
+                    metadata=metadata if isinstance(metadata, dict) else None,
+                )
+                _append_event(
+                    conn, task_id, review_gate.GATE_EVENT,
+                    {
+                        **_gate_plan,
+                        "author_summary": (
+                            _gate_summary.strip().splitlines()[0][:400]
+                            if _gate_summary else None
+                        ),
+                    },
+                )
+                _gated = True
+        if _gated:
+            return True
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4941,6 +4987,28 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # A task that went through the gate is completing for the second time,
+        # now by its reviewer. Hand ownership back to the author so the board
+        # attributes the work correctly; the review itself stays in the events.
+        _prior_gate = review_gate.gate_info(conn, task_id)
+        if _prior_gate and _prior_gate.get("original_assignee"):
+            _reviewer_row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _reviewer = _reviewer_row["assignee"] if _reviewer_row else None
+            if _reviewer == _prior_gate.get("reviewer"):
+                conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ?",
+                    (_prior_gate["original_assignee"], task_id),
+                )
+                _append_event(
+                    conn, task_id, review_gate.GATE_CLEARED_EVENT,
+                    {
+                        "risk_class": _prior_gate.get("risk_class"),
+                        "reviewer": _reviewer,
+                        "restored_assignee": _prior_gate["original_assignee"],
+                    },
+                )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
