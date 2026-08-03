@@ -899,7 +899,7 @@ def _(home, kb):
             raise AssertionError("whitespace-only title should have been rejected")
         except ValueError:
             pass
-        # Empty body → accept (legitimate: just title says it all)
+        # Empty body → accept as a draft; the dispatcher refuses to spawn it.
         tid = kb.create_task(conn, title="empty body ok", body="", assignee="w")
         assert kb.get_task(conn, tid).body in {"", None}
         # Empty summary on complete → accept
@@ -907,7 +907,7 @@ def _(home, kb):
         kb.complete_task(conn, tid, summary="")
         run = kb.latest_run(conn, tid)
         # Empty summary falls back to result; both empty → None on run
-        print("  empty body accepted, empty-title rejected")
+        print("  empty-body draft accepted, empty-title rejected")
     finally:
         conn.close()
 
