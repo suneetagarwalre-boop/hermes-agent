@@ -127,6 +127,7 @@ _TECHNICAL_DIRECTIVE_RE = re.compile(
     r"modules?|workflows?|branches?|plist)\b"
     r"|(?:implement|deploy|migrate|install|configure)\s+"
     r"(?:(?:the|this|that|our|a|an|existing|current|new|hermes)\s+){0,4}"
+    r"(?:(?:python|javascript|typescript|bash|shell|sql|git|server|launchd)\s+)?"
     r"(?:code|codebase|repository|repo|infrastructure|infra|software|database|"
     r"api|service|integration|cli|daemon|server|docker|container|kubernetes|"
     r"launchd|config(?:uration)?|schema|migration|package|application|app)\b"

@@ -176,6 +176,8 @@ def test_explicit_engineering_intent_still_routes_to_stark():
         ("Draft a Facebook post; update the server config", "Run the task."),
         ("Draft a Facebook post and edit the Python module", "Run the task."),
         ("Draft a Facebook post; then build an API service", "Run the task."),
+        ("Configure the Python application", "Apply the runtime changes."),
+        ("Install the Python package", "Verify the environment afterward."),
     ],
 )
 def test_explicit_technical_work_assigned_to_redd_can_still_route_to_stark(
