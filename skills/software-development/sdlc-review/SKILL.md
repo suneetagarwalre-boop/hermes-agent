@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
-description: "Independent verification pass for a high-risk kanban task before it can complete."
-version: 1.0.0
+description: "Domain-aware review pass for a routed kanban task before it can complete."
+version: 1.1.0
 author: Hermes Agent (Suneet fleet)
 license: MIT
 platforms: [linux, macos, windows]
@@ -11,22 +11,23 @@ metadata:
     related_skills: [requesting-code-review, github-code-review, systematic-debugging]
 ---
 
-# Independent Verification Pass
+# Domain-Aware Verification Pass
 
-You are the **reviewer**, not the author. Another agent did this work and moved
-it into the review lane. Your job is to decide whether it is actually correct
-and safe to complete — not to redo it, and not to rubber-stamp it.
+You are the **reviewer**. For operational risk classes, another agent did this
+work and you provide independent verification. For the `content` class, Redd
+keeps ownership: this is a domain revision pass, not engineering review.
 
 The dispatcher force-loads this skill for every task in `review`. It is
-reached automatically: a high-risk task that tried to go `done` was routed here
-instead by the verification gate (`hermes_cli/review_gate.py`).
+reached automatically when a routed task tries to go `done` and the verification
+gate (`hermes_cli/review_gate.py`) sends it through its domain review path.
 
 ## Read this first
 
-1. `kanban_show(<task_id>)` — the task, its body, and its event history.
+1. `kanban_show(<task_id>)` — the task, its original body, comments, and event history.
 2. Find the `review_gate_engaged` event. Its payload tells you the
-   **risk_class**, the **original_assignee** (the author), and that you were
-   picked precisely because you are not them.
+   **risk_class**, the **original_assignee**, and the routed reviewer. Reviewers
+   differ from authors for operational risk classes; `content` intentionally
+   routes Redd → Redd.
 3. Read the author's completion summary and any attached artifacts before you
    form an opinion.
 
@@ -39,6 +40,12 @@ in a summary is not evidence.
 
 Check by risk class:
 
+- **content** — Does the draft satisfy the requested format, voice, factual
+  constraints, and CTA? Fix semantic or prose defects in the content path; do
+  not relabel them as engineering issues or hand them to Stark merely because
+  the copy mentions systems, workflows, or building. A task that actually asks
+  to send, publish, bulk-update, or delete something is operational work, not a
+  content draft, and keeps its operational risk class.
 - **engineering** — Does the change do what the summary says? Read the actual
   diff or file, don't trust the description. Were tests run, and did they pass?
   Any migration, schema, or config edit reversible? Any secret, token, or
@@ -79,7 +86,9 @@ question. Name the file, the number, the claim, the recipient.
 
 ## Do not
 
-- Do not rewrite the work yourself. Reject it with a reason; the author owns the fix.
+- For operational risk classes, do not rewrite the work yourself. Reject it
+  with a reason; the author owns the fix. For `content`, Redd owns the revision
+  pass and may correct prose before completing.
 - Do not approve because it looks plausible. If you could not verify a load-bearing
   claim, that is a rejection, and say which claim.
 - Do not widen scope. You are reviewing this task, not the surrounding system.

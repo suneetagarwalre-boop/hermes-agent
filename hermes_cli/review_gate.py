@@ -14,18 +14,21 @@ use `kanban_block(reason="review-required: ...")` instead, which is a human
 escalation hatch, not an automated gate.
 
 This module is the missing producer side. It intercepts completion: when a
-high-risk task tries to go `running -> done`, it goes `running -> review`
-instead, reassigned to a DIFFERENT profile. The existing dispatcher then picks
-it up on its next tick and spawns the reviewer through the existing spawn path.
-No new permanent agent, no new daemon, no schema migration.
+routed task tries to go `running -> done`, it goes `running -> review` instead.
+Risk-bearing work is reassigned to a DIFFERENT profile; Redd-owned content stays
+with Redd for its domain revision pass. The existing dispatcher then picks it
+up on its next tick and spawns the reviewer through the existing spawn path. No
+new permanent agent, no new daemon, no schema migration.
 
 INDEPENDENCE
 ------------
 `claim_review_task` copies `tasks.assignee` into the reviewer's run, so whoever
 owns the task at review time IS the reviewer. Rather than patch that function,
-the gate reassigns `tasks.assignee` to the routed reviewer on the way in — the
-author never reviews their own work. The original assignee is preserved in the
-`review_gate_engaged` event payload and restored when the review completes.
+the gate sets `tasks.assignee` to the routed domain reviewer on the way in.
+Operational risk classes never self-review. Content is the intentional
+exception: prose feedback and revision remain with Redd. The original assignee
+is preserved in the `review_gate_engaged` event payload and restored when the
+review completes.
 
 RE-ENTRY
 --------
@@ -45,8 +48,10 @@ GATE_EVENT = "review_gate_engaged"
 GATE_CLEARED_EVENT = "review_gate_cleared"
 
 # --- risk classes ---------------------------------------------------------- #
-# Deterministic keyword match, same philosophy as fleet_health: a regex, not a
-# judgment call. Ordered — first match wins, most destructive first.
+# Classification is domain-first for specialist-owned content, then falls back
+# to deterministic risk patterns. Ordered — first match wins, most destructive
+# first. Broad operational words never outweigh a clear content brief by
+# themselves.
 RISK_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("destructive_ops", re.compile(
         r"\b(delete|drop|truncate|purge|wipe|destroy|rm -rf|force[- ]push|"
@@ -72,10 +77,11 @@ RISK_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 # Reviewer routing. Every value MUST be an existing profile — this gate creates
-# no new agents. Order in the fallback list matters: first entry that is not the
-# author wins, so independence is guaranteed even when the author IS the
-# natural reviewer for that class.
+# no new agents. Operational classes select the first entry that is not the
+# author. Content deliberately stays with Redd because feedback is revision,
+# not engineering verification.
 REVIEWER_ROUTES: dict[str, list[str]] = {
+    "content":         ["redd"],
     "engineering":     ["stark", "dave", "martin"],
     "research":        ["dave", "martin", "stark"],
     "outbound_comms":  ["katt", "dave", "martin"],
@@ -87,12 +93,110 @@ DEFAULT_ROUTE = ["dave", "martin", "stark"]
 # Explicit overrides an author (or Suneet) can put in the task body.
 _FORCE_RE = re.compile(r"\[risk:\s*([a-z_]+)\s*\]", re.I)
 
+# Redd owns content creation and revision. These signals intentionally include
+# the ordinary nouns used in briefs (Facebook, copy, voice, Notion/Drive
+# content) and do not treat generic words such as system/workflow/build as
+# engineering intent.
+_CONTENT_ASSIGNEES = frozenset({"redd"})
+_CONTENT_DOMAIN_RE = re.compile(
+    r"\b(facebook|linkedin|email|newsletter|script|voice|copy|content|post|"
+    r"caption|article|blog|draft|rewrite|hook|cta|notion|drive|perry)\b",
+    re.I,
+)
 
-def classify(title: str, body: str) -> Optional[str]:
+# A directive is a title/body line whose leading verb asks the worker to act.
+# Anchoring here is what distinguishes "Rewrite Python code" from content such
+# as "Explain how to rewrite Python code". Common bullets, labels, and polite
+# prefixes are accepted so risk cannot be bypassed with "Please" or
+# "Go ahead and".
+_DIRECTIVE_START = (
+    r"(?:^|\n)\s*(?:[-*]\s*)?"
+    r"(?:(?:requirements?|task|implementation)\s*:\s*)?"
+    r"(?:(?:please|kindly|go ahead and|now|then|could you|can you|would you)\s+)?"
+)
+
+_TECHNICAL_DIRECTIVE_RE = re.compile(
+    _DIRECTIVE_START
+    + r"(?:technical implementation\b"
+    r"|(?:patch|refactor|implement|debug|deploy|migrate|commit|merge|install|"
+    r"configure|rewrite|change|fix)\b.{0,60}\b(?:code|"
+    r"codebase|git|repository|repo|infrastructure|infra|software|python|"
+    r"javascript|typescript|bash|shell|sql|database|api|cli|daemon|server|"
+    r"docker|container|kubernetes|launchd|config(?:uration)?|schema|bug|"
+    r"test(?:s| suite)?)\b"
+    r"|(?:write|edit|modify)\s+(?:(?:the|this)\s+)?(?:source\s+)?(?:code|"
+    r"codebase|python file|javascript file|typescript file|config(?:uration)? file)\b"
+    r"|(?:add|run)\b.{0,30}\b(?:pytest|unit tests?|regression tests?|test suite)\b"
+    r"|build\b.{0,50}\b(?:app|application|api|service|integration|cli|package|"
+    r"container|website|software|code|infrastructure|infra|docker)\b"
+    r"|git\s+(?:commit|push)\b"
+    r"|(?:open|create)\b.{0,30}\bpull request\b)",
+    re.I | re.M,
+)
+
+# Side-effect directives are different from drafting content that merely talks
+# about those actions. These command-shaped patterns let operational risk keep
+# precedence without letting words in copy ("delete bad habits", "publish when
+# ready") hijack every Redd brief.
+_DESTRUCTIVE_INTENT_RE = re.compile(
+    _DIRECTIVE_START
+    + r"(?:delete|drop|truncate|purge|wipe|destroy|revoke|deprovision|"
+    r"tear ?down|uninstall|force[- ]push)\b.{0,60}\b(?:posts?|files?|records?|"
+    r"contacts?|leads?|subscribers?|accounts?|users?|database|schema|tables?|"
+    r"repository|repo|branches?|containers?|services?|deployment|integration)\b",
+    re.I | re.M,
+)
+_BULK_CRM_INTENT_RE = re.compile(
+    _DIRECTIVE_START
+    + r"(?:(?:bulk|mass|batch)\b.{0,80}\b(?:contacts?|leads?|subscribers?)\b"
+    r"|(?:import|dedupe|email|tag|update)\b.{0,40}\b(?:all|every)\b.{0,40}"
+    r"\b(?:crm\s+)?(?:contacts?|leads?|subscribers?)\b)",
+    re.I | re.M,
+)
+_OUTBOUND_INTENT_RE = re.compile(
+    _DIRECTIVE_START
+    + r"(?:send\b.{0,60}\b(?:email|newsletter|campaign|announcement|message|"
+    r"facebook\s+post|linkedin\s+post)\b"
+    r"|publish\s+.{0,60}\b(?:facebook|linkedin|post|article|newsletter|content|copy)\b"
+    r"|post\s+(?:(?:the|this|approved|final)\s+)?(?:(?:facebook|linkedin)\s+)?"
+    r"(?:post|article|content)\b"
+    r"|schedule\s+(?:(?:the|this|approved|final)\s+)?(?:post|email|newsletter|"
+    r"campaign)\b(?!\s+(?:copy|draft|caption))"
+    r"|blast\b.{0,40}\b(?:email|newsletter|campaign|announcement)\b)",
+    re.I | re.M,
+)
+
+
+def _explicit_operational_class(blob: str) -> Optional[str]:
+    if _DESTRUCTIVE_INTENT_RE.search(blob):
+        return "destructive_ops"
+    if _BULK_CRM_INTENT_RE.search(blob):
+        return "bulk_crm"
+    if _OUTBOUND_INTENT_RE.search(blob):
+        return "outbound_comms"
+    return None
+
+
+def _has_explicit_engineering_intent(blob: str) -> bool:
+    return _TECHNICAL_DIRECTIVE_RE.search(blob) is not None
+
+
+def _is_redd_content_task(blob: str, assignee: Optional[str]) -> bool:
+    return (
+        (assignee or "").lower() in _CONTENT_ASSIGNEES
+        and _CONTENT_DOMAIN_RE.search(blob) is not None
+    )
+
+
+def classify(
+    title: str,
+    body: str,
+    assignee: Optional[str] = None,
+) -> Optional[str]:
     """Return the risk class for a task, or None if it needs no review.
 
     An explicit ``[risk:none]`` marker opts out; ``[risk:engineering]`` (or any
-    known class) opts in and overrides the keyword scan.
+    known class) opts in and overrides domain detection and the keyword scan.
     """
     blob = f"{title or ''}\n{body or ''}"
     forced = _FORCE_RE.search(blob)
@@ -102,6 +206,13 @@ def classify(title: str, body: str) -> Optional[str]:
             return None
         if val in REVIEWER_ROUTES:
             return val
+    operational_class = _explicit_operational_class(blob)
+    if operational_class:
+        return operational_class
+    if _has_explicit_engineering_intent(blob):
+        return "engineering"
+    if _is_redd_content_task(blob, assignee):
+        return "content"
     for name, pat in RISK_PATTERNS:
         if pat.search(blob):
             return name
@@ -109,7 +220,15 @@ def classify(title: str, body: str) -> Optional[str]:
 
 
 def pick_reviewer(risk_class: str, author: Optional[str]) -> Optional[str]:
-    """First routed profile that is not the author. Independence is the point."""
+    """Pick the domain reviewer, avoiding self-review except for content.
+
+    Content feedback is revision work owned by Redd, so Redd remains the
+    assignee through that review pass. Risk-bearing operational classes keep
+    the original independent-review invariant.
+    """
+    if risk_class == "content":
+        route = REVIEWER_ROUTES.get(risk_class, [])
+        return route[0] if route else None
     for cand in REVIEWER_ROUTES.get(risk_class, DEFAULT_ROUTE) + DEFAULT_ROUTE:
         if cand and cand != (author or ""):
             return cand
@@ -158,7 +277,7 @@ def evaluate(conn: sqlite3.Connection, task_id: str) -> Tuple[bool, Optional[dic
         return False, None
     if already_gated(conn, task_id):
         return False, None
-    risk_class = classify(title or "", body or "")
+    risk_class = classify(title or "", body or "", assignee=assignee)
     if not risk_class:
         return False, None
     reviewer = pick_reviewer(risk_class, assignee)
