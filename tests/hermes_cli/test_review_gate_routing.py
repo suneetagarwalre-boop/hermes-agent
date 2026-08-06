@@ -80,12 +80,56 @@ def test_redd_content_domain_wins_over_incidental_engineering_words():
             "Explain Git commits and Docker infrastructure in plain English.",
         ),
         (
+            "Draft a LinkedIn post",
+            "Explain how teams fix Git workflows and deploy infrastructure safely.",
+        ),
+        (
+            "Build a Facebook post about API infrastructure",
+            "Return only the draft.",
+        ),
+        (
+            "Rewrite this LinkedIn post about Python code",
+            "Return only the copy.",
+        ),
+        (
             "Draft a Facebook post",
             "Use this hook verbatim:\nDelete bad habits before they delete momentum.",
         ),
         (
+            "Draft a Facebook post",
+            "Use this hook verbatim:\nDelete old Facebook posts before they delete momentum.",
+        ),
+        (
+            "Draft a LinkedIn post",
+            'Quoted copy: "Publish bold ideas. Build systems. Rewrite the rules. '
+            'Delete bad habits."',
+        ),
+        (
+            "Draft a Facebook post",
+            "Hook below:\nDelete old Facebook posts.\nPublish approved newsletter.\n"
+            "Build an API service.\nRewrite Python code.",
+        ),
+        (
+            "Draft a Facebook post",
+            '"Delete old Facebook posts.\nPublish approved newsletter.\n'
+            'Build an API service.\nRewrite Python code."',
+        ),
+        (
+            "Draft a Facebook post",
+            "Hook follows\nDelete old Facebook posts.\nPublish approved newsletter.",
+        ),
+        (
+            "Draft a Facebook post",
+            "Hook below:\nDelete old Facebook posts.\n\nPublish approved newsletter.\n"
+            "Build an API service.",
+        ),
+        (
             "Publish-ready Facebook post",
             "Draft the final copy; do not publish it.",
+        ),
+        (
+            "Action: draft final Facebook post; do not publish",
+            "Return only the final copy.",
         ),
         (
             "Schedule post copy",
@@ -126,6 +170,12 @@ def test_explicit_engineering_intent_still_routes_to_stark():
         ("Technical implementation", "Change the Git workflow and commit the changes."),
         ("Technical task", "Please build an API service."),
         ("Technical task", "Could you build a new CLI package?"),
+        ("Draft a Facebook post and fix the Git workflow", "Return the draft too."),
+        ("Draft a Facebook post and create a Git branch", "Commit no content."),
+        ("Draft a Facebook post; then push the Git changes", "Run the task."),
+        ("Draft a Facebook post; update the server config", "Run the task."),
+        ("Draft a Facebook post and edit the Python module", "Run the task."),
+        ("Draft a Facebook post; then build an API service", "Run the task."),
     ],
 )
 def test_explicit_technical_work_assigned_to_redd_can_still_route_to_stark(
@@ -141,6 +191,36 @@ def test_explicit_technical_work_assigned_to_redd_can_still_route_to_stark(
 @pytest.mark.parametrize(
     ("title", "body", "expected_class", "expected_reviewer"),
     [
+        (
+            "Action: publish approved newsletter",
+            "",
+            "outbound_comms",
+            "katt",
+        ),
+        (
+            "Action: draft and publish the approved Facebook post",
+            "",
+            "outbound_comms",
+            "katt",
+        ),
+        (
+            "Action: draft final Facebook post; then publish it",
+            "",
+            "outbound_comms",
+            "katt",
+        ),
+        (
+            "Schedule the approved post",
+            "",
+            "outbound_comms",
+            "katt",
+        ),
+        (
+            "Draft a Facebook post",
+            "Copy below:\nDream bigger.\n\nAction: publish approved newsletter",
+            "outbound_comms",
+            "katt",
+        ),
         (
             "Delete old Facebook posts",
             "Please delete all Facebook posts from the company page.",

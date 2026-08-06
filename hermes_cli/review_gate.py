@@ -111,25 +111,36 @@ _CONTENT_DOMAIN_RE = re.compile(
 # "Go ahead and".
 _DIRECTIVE_START = (
     r"(?:^|\n)\s*(?:[-*]\s*)?"
-    r"(?:(?:requirements?|task|implementation)\s*:\s*)?"
+    r"(?:(?:action|requirements?|task|implementation)\s*:\s*)?"
     r"(?:(?:please|kindly|go ahead and|now|then|could you|can you|would you)\s+)?"
 )
 
 _TECHNICAL_DIRECTIVE_RE = re.compile(
     _DIRECTIVE_START
     + r"(?:technical implementation\b"
-    r"|(?:patch|refactor|implement|debug|deploy|migrate|commit|merge|install|"
-    r"configure|rewrite|change|fix)\b.{0,60}\b(?:code|"
-    r"codebase|git|repository|repo|infrastructure|infra|software|python|"
-    r"javascript|typescript|bash|shell|sql|database|api|cli|daemon|server|"
-    r"docker|container|kubernetes|launchd|config(?:uration)?|schema|bug|"
-    r"test(?:s| suite)?)\b"
+    r"|(?:patch|refactor|debug|rewrite|change|fix|edit|modify|update)\s+"
+    r"(?:(?:the|this|that|our|a|an|existing|current|new|hermes)\s+){0,4}"
+    r"(?:(?:python|javascript|typescript|bash|shell|sql|git|server|launchd)\s+)?"
+    r"(?:(?:source|application)\s+)?(?:code|codebase|repository|repo|"
+    r"infrastructure|infra|software|database|api|cli|daemon|server|docker|"
+    r"container|kubernetes|launchd|config(?:uration)?|schema|bug|tests?|files?|"
+    r"modules?|workflows?|branches?|plist)\b"
+    r"|(?:implement|deploy|migrate|install|configure)\s+"
+    r"(?:(?:the|this|that|our|a|an|existing|current|new|hermes)\s+){0,4}"
+    r"(?:code|codebase|repository|repo|infrastructure|infra|software|database|"
+    r"api|service|integration|cli|daemon|server|docker|container|kubernetes|"
+    r"launchd|config(?:uration)?|schema|migration|package|application|app)\b"
     r"|(?:write|edit|modify)\s+(?:(?:the|this)\s+)?(?:source\s+)?(?:code|"
     r"codebase|python file|javascript file|typescript file|config(?:uration)? file)\b"
     r"|(?:add|run)\b.{0,30}\b(?:pytest|unit tests?|regression tests?|test suite)\b"
-    r"|build\b.{0,50}\b(?:app|application|api|service|integration|cli|package|"
-    r"container|website|software|code|infrastructure|infra|docker)\b"
+    r"|build\s+(?:(?:the|this|that|our|a|an|existing|current|new|hermes)\s+){0,4}"
+    r"(?:app|application|api|service|integration|cli|package|container|website|"
+    r"software|code|infrastructure|infra|docker)\b"
     r"|git\s+(?:commit|push)\b"
+    r"|push\s+(?:(?:the|this|our|a)\s+)?(?:git\s+)?(?:changes?|branch)\b"
+    r"|(?:commit|merge)\s+(?:(?:the|this|our|a)\s+)?(?:git\s+)?(?:changes?|"
+    r"branch|pull request)\b"
+    r"|create\s+(?:(?:the|this|our|a|an|new)\s+){0,3}(?:git\s+)?branch\b"
     r"|(?:open|create)\b.{0,30}\bpull request\b)",
     re.I | re.M,
 )
@@ -155,30 +166,140 @@ _BULK_CRM_INTENT_RE = re.compile(
 )
 _OUTBOUND_INTENT_RE = re.compile(
     _DIRECTIVE_START
-    + r"(?:send\b.{0,60}\b(?:email|newsletter|campaign|announcement|message|"
+    + r"(?:publish\b(?![- ]ready\b)"
+    r"|(?:send|post|schedule)\s+(?:it|this|them)\b"
+    r"|send\b.{0,60}\b(?:email|newsletter|campaign|announcement|message|"
     r"facebook\s+post|linkedin\s+post)\b"
     r"|publish\s+.{0,60}\b(?:facebook|linkedin|post|article|newsletter|content|copy)\b"
     r"|post\s+(?:(?:the|this|approved|final)\s+)?(?:(?:facebook|linkedin)\s+)?"
     r"(?:post|article|content)\b"
-    r"|schedule\s+(?:(?:the|this|approved|final)\s+)?(?:post|email|newsletter|"
+    r"|schedule\s+(?:(?:the|this|approved|final)\s+){0,3}(?:post|email|newsletter|"
     r"campaign)\b(?!\s+(?:copy|draft|caption))"
     r"|blast\b.{0,40}\b(?:email|newsletter|campaign|announcement)\b)",
     re.I | re.M,
 )
 
 
+_QUOTED_COPY_LABEL_RE = re.compile(
+    r"\b(?:hook|copy|quote|example|sample|caption)\b.*"
+    r"(?:verbatim|word[- ]for[- ]word|below|follows?|:)\s*$",
+    re.I,
+)
+
+
+def _actionable_text(blob: str) -> str:
+    """Remove quoted/example copy before looking for executable directives.
+
+    Content briefs routinely contain imperative hook text ("Delete bad habits")
+    that describes the artifact rather than an action for the worker.  Mask
+    explicit quote blocks and the contiguous block following a labelled copy
+    marker; preserve every other line so genuine operational instructions still
+    route. A blank line ends an unquoted labelled block.
+    """
+    actionable: list[str] = []
+    copy_block = False
+    closing_quote: Optional[str] = None
+    for raw_line in blob.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if not copy_block:
+                actionable.append("")
+            continue
+        if closing_quote:
+            if closing_quote in line:
+                closing_quote = None
+            continue
+        if copy_block:
+            if re.match(r"^(?:end|close)\s+(?:hook|copy|quote|example|sample|caption)\b", line, re.I):
+                copy_block = False
+                continue
+            if re.match(r"^action\s*:", line, re.I):
+                copy_block = False
+            else:
+                continue
+        if line.startswith(">"):
+            continue
+        if _QUOTED_COPY_LABEL_RE.search(line):
+            copy_block = True
+            # Keep only text before the label. Anything after it is artifact
+            # copy, including same-line quoted examples.
+            label = re.search(r"\b(?:hook|copy|quote|example|sample|caption)\b", line, re.I)
+            if label and label.start() > 0:
+                actionable.append(line[:label.start()])
+            continue
+        if ((line.startswith('"') and line.endswith('"'))
+                or (line.startswith("'") and line.endswith("'"))
+                or (line.startswith("“") and line.endswith("”"))):
+            continue
+        if line.startswith('"'):
+            closing_quote = '"'
+            continue
+        if line.startswith("'"):
+            closing_quote = "'"
+            continue
+        if line.startswith("“"):
+            closing_quote = "”"
+            continue
+        # Quoted text on an instruction line is content data, not another
+        # instruction. Preserve the surrounding request.
+        line = re.sub(r'"[^"\n]*"|“[^”\n]*”|\'[^\'\n]*\'', "", line)
+        actionable.append(line)
+    text = "\n".join(actionable)
+    # A request may contain multiple affirmative actions on one line ("draft
+    # the post and publish it" or "draft copy; then build the API"). Give each
+    # executable verb its own directive boundary. Negated clauses do not match
+    # the lookahead and remain inert.
+    action_verbs = (
+        r"delete|drop|truncate|purge|wipe|destroy|revoke|deprovision|tear ?down|"
+        r"uninstall|force[- ]push|bulk|mass|batch|import|dedupe|email|tag|update|"
+        r"send|publish|post|schedule|blast|patch|refactor|debug|rewrite|change|"
+        r"fix|edit|modify|update|implement|deploy|migrate|install|configure|write|"
+        r"add|run|build|git|push|commit|merge|open|create"
+    )
+    # Semicolons and "then" unambiguously introduce another clause. "And" is
+    # narrower: split only `draft and <action>` or `<content artifact> and
+    # <action>`. That avoids turning descriptive copy such as "Explain how teams
+    # fix Git workflows and deploy infrastructure" into engineering work.
+    text = re.sub(
+        rf"\s*(?:;|\bthen\b)\s*(?=(?:please\s+)?(?:{action_verbs})\b)",
+        "\n",
+        text,
+        flags=re.I,
+    )
+    split_lines: list[str] = []
+    content_objects = r"facebook post|linkedin post|post|copy|newsletter|script|email|article|caption|content"
+    for line in text.splitlines():
+        line = re.sub(
+            rf"\b(draft|write|prepare|revise|produce)\s+and\s+"
+            rf"(?=(?:please\s+)?(?:{action_verbs})\b)",
+            r"\1\n",
+            line,
+            flags=re.I,
+        )
+        line = re.sub(
+            rf"\b({content_objects})\s+and\s+"
+            rf"(?=(?:please\s+)?(?:{action_verbs})\b)",
+            r"\1\n",
+            line,
+            flags=re.I,
+        )
+        split_lines.append(line)
+    return "\n".join(split_lines)
+
+
 def _explicit_operational_class(blob: str) -> Optional[str]:
-    if _DESTRUCTIVE_INTENT_RE.search(blob):
+    actionable = _actionable_text(blob)
+    if _DESTRUCTIVE_INTENT_RE.search(actionable):
         return "destructive_ops"
-    if _BULK_CRM_INTENT_RE.search(blob):
+    if _BULK_CRM_INTENT_RE.search(actionable):
         return "bulk_crm"
-    if _OUTBOUND_INTENT_RE.search(blob):
+    if _OUTBOUND_INTENT_RE.search(actionable):
         return "outbound_comms"
     return None
 
 
 def _has_explicit_engineering_intent(blob: str) -> bool:
-    return _TECHNICAL_DIRECTIVE_RE.search(blob) is not None
+    return _TECHNICAL_DIRECTIVE_RE.search(_actionable_text(blob)) is not None
 
 
 def _is_redd_content_task(blob: str, assignee: Optional[str]) -> bool:
