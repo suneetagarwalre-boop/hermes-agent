@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+_DISCORD_MENTION_TOKEN_RE = re.compile(r"<@([!&]?)(\d+)>")
 
 
 def _format_discord_markdown_link(label: str, url: str) -> str:
@@ -6150,6 +6151,37 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _normalize_mention_aliases(self, content: str) -> str:
+        """Resolve configured Discord user/role tokens before agent dispatch.
+
+        Discord leaves role mentions in message content as opaque ``<@&ID>``
+        tokens. Models cannot reliably infer the human-facing identity from an
+        ID, and ``Message.clean_content`` is unsuitable here because it depends
+        on guild cache state and may replace unrelated mentions. Profiles can
+        therefore declare a narrow ID-to-name map under
+        ``discord.mention_aliases``. Both role and user tokens for a configured
+        identity resolve to the same canonical ``@Name`` text while every
+        unconfigured token remains byte-for-byte unchanged.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        raw_aliases = extra.get("mention_aliases") if isinstance(extra, dict) else None
+        if not isinstance(raw_aliases, dict) or not raw_aliases:
+            return content
+
+        aliases = {
+            str(raw_id).strip(): str(name).strip().lstrip("@")
+            for raw_id, name in raw_aliases.items()
+            if str(raw_id).strip().isdigit() and str(name).strip().lstrip("@")
+        }
+        if not aliases:
+            return content
+
+        def _replace(match: re.Match[str]) -> str:
+            alias = aliases.get(match.group(2))
+            return f"@{alias}" if alias else match.group(0)
+
+        return _DISCORD_MENTION_TOKEN_RE.sub(_replace, content)
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -7708,6 +7740,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        normalized_content = self._normalize_mention_aliases(normalized_content)
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -9945,6 +9978,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
+    mention_aliases_cfg = discord_cfg.get("mention_aliases")
+    if isinstance(mention_aliases_cfg, dict):
+        seeded_extra["mention_aliases"] = {
+            str(raw_id): str(name)
+            for raw_id, name in mention_aliases_cfg.items()
+        }
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only
