@@ -860,6 +860,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        # A proof contract must already be persisted before the completion
+        # transition reads it. Reject combined body+done PATCHes so a newly
+        # added marker cannot be applied only after an ungated completion.
+        if (
+            payload.status == "done"
+            and payload.body is not None
+            and payload.body != task.body
+        ):
+            from hermes_cli.kanban_proof_gate import has_proof_gate_marker
+
+            if has_proof_gate_marker(task.body) or has_proof_gate_marker(payload.body):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "proof-gated body edits must be saved before completing the task"
+                    ),
+                )
+
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
@@ -876,12 +894,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.ProofGateRejectedError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -974,6 +995,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
             with kanban_db.write_txn(conn):
+                current = conn.execute(
+                    "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if current is None:
+                    raise HTTPException(status_code=404, detail="task not found")
+                if payload.body is not None:
+                    try:
+                        kanban_db.ensure_proof_gate_body_edit_allowed(
+                            conn,
+                            task_id,
+                            current_body=current["body"],
+                            proposed_body=payload.body,
+                        )
+                    except kanban_db.ProofGateContractLockedError as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=str(exc),
+                        )
                 sets, vals = [], []
                 if payload.title is not None:
                     if not payload.title.strip():

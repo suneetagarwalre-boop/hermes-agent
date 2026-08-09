@@ -115,6 +115,111 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_dashboard_completion_respects_deterministic_proof_gate(client, tmp_path):
+    workspace = tmp_path / "proof-gate-workspace"
+    workspace.mkdir()
+    body = """Expected outcome: proof file contains PASS.
+Evidence/verification: exact local read-back.
+Hard constraints: sandbox only.
+Boundaries/no side effects: this temporary workspace only.
+Stop condition: stop after two turns.
+Turn budget: 2.
+
+<!-- hermes-proof-gate
+{"type":"file_equals","path":"proof.txt","expected":"PASS\\n","max_bytes":1024}
+-->
+"""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dashboard proof-gate canary",
+            body=body,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            goal_mode=True,
+            goal_max_turns=2,
+        )
+        assert kb.claim_task(conn, task_id, claimer="dashboard-canary") is not None
+
+    rejected = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "trust me"},
+    )
+    assert rejected.status_code == 409
+    assert "deterministic proof gate" in rejected.json()["detail"]
+
+    body_edit = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"body": "marker removed"},
+    )
+    assert body_edit.status_code == 409
+    assert "immutable" in body_edit.json()["detail"]
+
+    requeued = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "ready"},
+    )
+    assert requeued.status_code == 200
+    body_edit_after_requeue = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"body": "marker removed after requeue"},
+    )
+    assert body_edit_after_requeue.status_code == 409
+
+    (workspace / "proof.txt").write_text("PASS\n", encoding="utf-8")
+    accepted = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "read-back passed"},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["task"]["status"] == "done"
+
+
+def test_dashboard_cannot_add_proof_marker_and_complete_in_one_patch(
+    client, tmp_path
+):
+    workspace = tmp_path / "combined-proof-gate-workspace"
+    workspace.mkdir()
+    proof_body = """Expected outcome: proof file contains PASS.
+Evidence/verification: exact local read-back.
+Hard constraints: sandbox only.
+Boundaries/no side effects: this temporary workspace only.
+Stop condition: stop after two turns.
+Turn budget: 2.
+
+<!-- hermes-proof-gate
+{"type":"file_equals","path":"proof.txt","expected":"PASS\\n","max_bytes":1024}
+-->
+"""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="combined dashboard proof-gate canary",
+            body="ordinary unmarked body",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "done",
+            "body": proof_body,
+            "summary": "attempt combined bypass",
+            "metadata": {"proof_gate_evidence": {"passed": True, "forged": True}},
+        },
+    )
+    assert response.status_code == 409
+    assert "must be saved before completing" in response.json()["detail"]
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.body == "ordinary unmarked body"
+        assert kb.latest_run(conn, task_id) is None
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

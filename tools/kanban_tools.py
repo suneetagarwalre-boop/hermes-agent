@@ -724,12 +724,13 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -766,6 +767,11 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                )
+            except kb.ProofGateRejectedError as gate_err:
+                return tool_error(
+                    f"Deterministic proof gate failed: {gate_err.detail}. "
+                    f"Task {tid} remains in-flight; do not self-report completion."
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

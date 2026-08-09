@@ -4833,6 +4833,62 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class ProofGateRejectedError(ValueError):
+    """Raised when an opt-in deterministic completion proof gate fails."""
+
+    def __init__(self, task_id: str, detail: str):
+        self.task_id = task_id
+        self.detail = detail
+        super().__init__(f"deterministic proof gate rejected completion: {detail}")
+
+
+class ProofGateContractLockedError(ValueError):
+    """Raised when a caller tries to edit a proof contract after its first run."""
+
+
+def ensure_proof_gate_body_edit_allowed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    current_body: Optional[str],
+    proposed_body: Optional[str],
+) -> None:
+    """Fail closed when adding, removing, or editing an in-use proof contract."""
+    if (proposed_body or "") == (current_body or ""):
+        return
+    from hermes_cli.kanban_proof_gate import has_proof_gate_marker
+
+    if not (
+        has_proof_gate_marker(current_body)
+        or has_proof_gate_marker(proposed_body)
+    ):
+        return
+    had_use = conn.execute(
+        """
+        SELECT 1
+         WHERE EXISTS (
+                   SELECT 1 FROM task_runs WHERE task_id = ?
+               )
+            OR EXISTS (
+                   SELECT 1 FROM task_events
+                    WHERE task_id = ?
+                      AND kind IN ('completed', 'completion_blocked_proof_gate')
+               )
+            OR EXISTS (
+                   SELECT 1 FROM tasks
+                    WHERE id = ?
+                      AND (status IN ('done', 'archived') OR completed_at IS NOT NULL)
+               )
+        """,
+        (task_id, task_id, task_id),
+    ).fetchone()
+    if had_use is not None:
+        raise ProofGateContractLockedError(
+            "proof-gated task body is immutable after its first run or "
+            "completion attempt; archive it and create a corrected card"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4873,6 +4929,47 @@ def complete_task(
     """
     now = int(time.time())
 
+    # Authoritative opt-in proof gate. This belongs at the DB transition API,
+    # not only in the worker tool/CLI wrappers: dashboard and internal callers
+    # also use complete_task directly. Only bounded file read-backs are
+    # supported; card text never becomes a shell command.
+    proof_task = get_task(conn, task_id)
+    proof_gate = None
+    proof_body: Optional[str] = None
+    proof_workspace: Optional[str] = None
+    proof_run_id: Optional[int] = None
+    if proof_task is not None and proof_task.status in {"running", "ready", "blocked"}:
+        from hermes_cli.kanban_proof_gate import evaluate_task_proof_gate
+
+        try:
+            proof_gate = evaluate_task_proof_gate(proof_task)
+        except ValueError as exc:
+            proof_gate = None
+            proof_error = f"invalid proof-gate contract: {exc}"
+        else:
+            proof_error = (
+                proof_gate.detail
+                if proof_gate is not None and not proof_gate.passed
+                else None
+            )
+        if proof_error:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_proof_gate",
+                    {"detail": proof_error},
+                )
+            raise ProofGateRejectedError(task_id, proof_error)
+        if proof_gate is not None:
+            metadata = dict(metadata or {})
+            metadata["proof_gate_evidence"] = dict(proof_gate.evidence)
+            # Bind the successful read-back to the exact persisted contract
+            # revision used by the later SQL compare-and-swap.
+            proof_body = proof_task.body
+            proof_workspace = proof_task.workspace_path
+            proof_run_id = proof_task.current_run_id
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -4904,7 +5001,143 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
-        if expected_run_id is None:
+        # Always re-read the persisted card while holding SQLite's write lock.
+        # Even an unmarked preflight must fail closed if a concurrent body edit
+        # adds a proof contract before the done transition.
+        locked_task = get_task(conn, task_id)
+        if (
+            proof_gate is None
+            and locked_task is not None
+            and locked_task.status in {"running", "ready", "blocked"}
+        ):
+            from hermes_cli.kanban_proof_gate import evaluate_task_proof_gate
+
+            try:
+                late_gate = evaluate_task_proof_gate(locked_task)
+            except ValueError as exc:
+                late_gate = None
+                late_error = f"invalid proof-gate contract: {exc}"
+            else:
+                late_error = (
+                    late_gate.detail
+                    if late_gate is not None and not late_gate.passed
+                    else None
+                )
+            if late_error:
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_proof_gate",
+                    {"detail": late_error},
+                )
+                return False
+            if late_gate is not None:
+                proof_gate = late_gate
+                proof_body = locked_task.body
+                proof_workspace = locked_task.workspace_path
+                proof_run_id = locked_task.current_run_id
+                metadata = dict(metadata or {})
+                metadata["proof_gate_evidence"] = dict(late_gate.evidence)
+
+        if proof_gate is not None:
+            # Re-read and re-evaluate while holding SQLite's write lock. This
+            # binds the file evidence to one immutable card/workspace/run
+            # revision through the done transition. The descriptor-relative
+            # reader bounds the filesystem side of the check.
+            if (
+                locked_task is None
+                or locked_task.body != proof_body
+                or locked_task.workspace_path != proof_workspace
+                or locked_task.current_run_id != proof_run_id
+            ):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_proof_gate",
+                    {"detail": "task contract or run revision changed during proof check"},
+                )
+                return False
+            try:
+                from hermes_cli.kanban_proof_gate import evaluate_task_proof_gate
+
+                locked_gate = evaluate_task_proof_gate(locked_task)
+            except ValueError as exc:
+                locked_gate = None
+                locked_error = f"invalid proof-gate contract: {exc}"
+            else:
+                locked_error = (
+                    locked_gate.detail
+                    if locked_gate is not None and not locked_gate.passed
+                    else None
+                )
+            if locked_error or locked_gate is None:
+                detail = locked_error or "proof-gate contract disappeared"
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_proof_gate",
+                    {"detail": detail},
+                )
+                return False
+            proof_gate = locked_gate
+            metadata = dict(metadata or {})
+            metadata["proof_gate_evidence"] = dict(locked_gate.evidence)
+        if proof_gate is not None and expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                   AND current_run_id IS ?
+                   AND body IS ?
+                   AND workspace_path IS ?
+                """,
+                (
+                    result,
+                    now,
+                    task_id,
+                    proof_run_id,
+                    proof_body,
+                    proof_workspace,
+                ),
+            )
+        elif proof_gate is not None:
+            assert expected_run_id is not None
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                   AND current_run_id = ?
+                   AND body IS ?
+                   AND workspace_path IS ?
+                """,
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id),
+                    proof_body,
+                    proof_workspace,
+                ),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4940,6 +5173,13 @@ def complete_task(
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
+            if proof_gate is not None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_proof_gate",
+                    {"detail": "task contract or run revision changed during proof check"},
+                )
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
@@ -4989,6 +5229,9 @@ def complete_task(
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
         if isinstance(metadata, dict):
+            proof_evidence = metadata.get("proof_gate_evidence")
+            if proof_gate is not None and isinstance(proof_evidence, dict):
+                completed_payload["proof_gate_evidence"] = proof_evidence
             md_artifacts = metadata.get("artifacts")
             if isinstance(md_artifacts, (list, tuple)):
                 cleaned_artifacts = [
@@ -5560,17 +5803,20 @@ def edit_completed_task_result(
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, body FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if not row or row["status"] != "done":
             return False
+        from hermes_cli.kanban_proof_gate import has_proof_gate_marker
+
+        preserve_proof_evidence = has_proof_gate_marker(row["body"])
         conn.execute(
             "UPDATE tasks SET result = ? WHERE id = ?",
             (result, task_id),
         )
         run = conn.execute(
             """
-            SELECT id FROM task_runs
+            SELECT id, metadata FROM task_runs
              WHERE task_id = ?
                AND outcome = 'completed'
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
@@ -5579,6 +5825,42 @@ def edit_completed_task_result(
             (task_id,),
         ).fetchone()
         run_id = int(run["id"]) if run else None
+        canonical_evidence = None
+        if preserve_proof_evidence and run and run["metadata"]:
+            try:
+                existing_run_metadata = json.loads(run["metadata"])
+            except (TypeError, json.JSONDecodeError):
+                existing_run_metadata = {}
+            if isinstance(existing_run_metadata, dict) and isinstance(
+                existing_run_metadata.get("proof_gate_evidence"), dict
+            ):
+                canonical_evidence = existing_run_metadata["proof_gate_evidence"]
+        completed_event = None
+        if preserve_proof_evidence:
+            completed_event = conn.execute(
+                """
+                SELECT payload FROM task_events
+                 WHERE task_id = ? AND kind = 'completed'
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if completed_event and completed_event["payload"]:
+            try:
+                completed_payload = json.loads(completed_event["payload"])
+            except (TypeError, json.JSONDecodeError):
+                completed_payload = {}
+            if (
+                canonical_evidence is None
+                and isinstance(completed_payload, dict)
+                and isinstance(completed_payload.get("proof_gate_evidence"), dict)
+            ):
+                canonical_evidence = completed_payload["proof_gate_evidence"]
+        if metadata is not None:
+            metadata = dict(metadata)
+            if canonical_evidence is not None:
+                metadata.pop("proof_gate_evidence", None)
+                metadata["proof_gate_evidence"] = canonical_evidence
         if run_id is None:
             run_id = _synthesize_ended_run(
                 conn, task_id,
@@ -5999,6 +6281,13 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        if body is not None:
+            ensure_proof_gate_body_edit_allowed(
+                conn,
+                task_id,
+                current_body=existing["body"],
+                proposed_body=body,
+            )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []

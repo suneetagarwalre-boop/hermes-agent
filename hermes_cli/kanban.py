@@ -2169,12 +2169,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+
             # Goal-mode pre-completion judge gate (mirrors the gate in
             # tools/kanban_tools.py:_handle_complete — Issue #38367).
             # Without this, a goal_mode worker can call
             # `hermes kanban complete <id>` from the terminal tool and
             # bypass the auxiliary judge that the tool-call path enforces.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode:
                 judge_available = False
                 try:
@@ -2213,13 +2214,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.ProofGateRejectedError as gate_err:
+                failed.append(tid)
+                print(
+                    f"kanban: deterministic proof gate for {tid} failed: "
+                    f"{gate_err.detail}; task remains in-flight",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
