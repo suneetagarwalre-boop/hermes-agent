@@ -130,6 +130,33 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_plain_english_reporting_guidance_is_fleet_wide():
+    """Every profile gets the user-facing contract, even with no tools loaded."""
+    from agent.prompt_builder import PLAIN_ENGLISH_REPORTING_GUIDANCE
+
+    stable = _stable_prompt(_make_agent(valid_tool_names=[]))
+    assert PLAIN_ENGLISH_REPORTING_GUIDANCE in stable
+    assert "first sentence what happened" in stable
+    assert "plain English must never weaken factual accuracy" in stable
+
+
+def test_plain_english_reporting_guidance_follows_loaded_soul():
+    """A profile SOUL cannot make the universal output contract fallback-only."""
+    from agent.prompt_builder import PLAIN_ENGLISH_REPORTING_GUIDANCE
+
+    with (
+        patch("run_agent.load_soul_md", return_value="PROFILE SOUL"),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        stable = build_system_prompt_parts(_make_agent(valid_tool_names=[]))["stable"]
+
+    assert stable.startswith("PROFILE SOUL\n\n")
+    assert PLAIN_ENGLISH_REPORTING_GUIDANCE in stable
+    assert stable.index("PROFILE SOUL") < stable.index(PLAIN_ENGLISH_REPORTING_GUIDANCE)
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
@@ -152,6 +179,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     )
     expected = "\n\n".join((
         "IDENTITY",
+        system_prompt.PLAIN_ENGLISH_REPORTING_GUIDANCE,
         "HELP",
         "STEER",
         "CODING_STABLE",
@@ -182,7 +210,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

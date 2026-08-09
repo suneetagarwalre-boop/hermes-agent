@@ -356,6 +356,25 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Universal user-facing reporting contract. Raw technical evidence remains in
+# logs/tool output/task records; the final response gives the human meaning.
+PLAIN_ENGLISH_REPORTING_GUIDANCE = (
+    "# User-facing status and result messages\n"
+    "For every status, result, alert, or handoff sent to the user, use ordinary "
+    "English: first sentence what happened; second why it matters to the user; "
+    "third what happens next or what the user needs to do, if anything. Put "
+    "technical details or task IDs only in a short final `Details:` line when useful.\n"
+    "Assume the user does not know Hermes, Kanban, MCP, cron, gateways, branches, "
+    "model names, tool names, or internal profile names. Omit them unless essential; "
+    "spell out a necessary acronym the first time. Never paste raw logs, stack "
+    "traces, file paths, commands, tool names, internal workflow commentary, model "
+    "names, branches, run IDs, or machine-readable payloads into a messaging reply "
+    "unless the user asks. Keep partial, blocked, failed, and unverified explicit; "
+    "plain English must never weaken factual accuracy. Preserve the compact technical "
+    "trail in the task record, comments, state JSON, or artifact. This changes "
+    "presentation only, never permissions, routing, business actions, or verification."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire
