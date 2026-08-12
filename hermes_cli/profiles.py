@@ -387,6 +387,166 @@ def profile_exists(name: str) -> bool:
     return get_profile_dir(canon).is_dir()
 
 
+def get_profile_capabilities(name: str, *, platform: str = "cli") -> list[tuple[str, str]]:
+    """Return verified ``(system, action)`` pairs from live profile config.
+
+    Capability declarations are policy, not proof by themselves. Their
+    ``requires`` entries must resolve through the same profile-aware config and
+    platform toolset logic used to build the worker's runtime tool surface.
+    Invalid declarations and unreadable configs fail closed.
+    """
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+        profile_dir = get_profile_dir(canon)
+        if not profile_dir.is_dir():
+            return []
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from agent.secret_scope import build_profile_secret_scope
+
+        # Read credentials from the candidate profile itself.  Do not infer
+        # authorization from the dispatcher's process environment: in a
+        # multi-profile gateway that environment can belong to a different
+        # agent.  ``requires.env`` below is checked against this isolated map.
+        profile_secrets = build_profile_secret_scope(profile_dir)
+        available_secret_names = {
+            key for key, value in profile_secrets.items() if str(value).strip()
+        }
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            config = load_config()
+            if not isinstance(config, dict):
+                return []
+            enabled_toolsets = set(_get_platform_tools(config, platform))
+
+            # ``_get_platform_tools`` intentionally supports process-level
+            # credential fallbacks for single-profile interactive sessions.
+            # Candidate routing is different: process credentials may belong
+            # to the dispatcher, so credential-auto-enabled toolsets must be
+            # proven from the candidate profile itself.
+            if "homeassistant" in enabled_toolsets and "HASS_TOKEN" not in available_secret_names:
+                enabled_toolsets.discard("homeassistant")
+            if "x_search" in enabled_toolsets and "XAI_API_KEY" not in available_secret_names:
+                try:
+                    from hermes_cli.auth import _read_xai_oauth_tokens
+
+                    _read_xai_oauth_tokens()
+                except Exception:
+                    enabled_toolsets.discard("x_search")
+
+            # Exact MCP tool requirements need more than an enabled server:
+            # verify them against the same fingerprinted discovery manifest the
+            # runtime uses for lazy registration. Missing/stale cache entries
+            # fail closed rather than treating a declaration as proof that a
+            # tool exists. The cache already reflects include/exclude glob
+            # semantics and include precedence.
+            from tools.mcp_schema_cache import (
+                config_fingerprint,
+                get_cached_entry,
+                tools_from_cache_entry,
+            )
+
+            mcp_manifests: dict[str, set[str]] = {}
+            raw_servers = config.get("mcp_servers") or {}
+            if isinstance(raw_servers, dict):
+                for server_name, server_cfg in raw_servers.items():
+                    if not isinstance(server_cfg, dict):
+                        continue
+                    entry = get_cached_entry(
+                        str(server_name), config_fingerprint(server_cfg)
+                    )
+                    if entry is None:
+                        continue
+                    mcp_manifests[str(server_name)] = {
+                        str(raw.get("name"))
+                        for raw in tools_from_cache_entry(entry)
+                        if isinstance(raw, dict) and raw.get("name")
+                    }
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return []
+
+    declarations = config.get("kanban_capabilities")
+    if not isinstance(declarations, list):
+        return []
+    mcp_servers = config.get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        return []
+
+    verified: set[tuple[str, str]] = set()
+    for declaration in declarations:
+        if not isinstance(declaration, dict):
+            continue
+        system = str(declaration.get("system") or "").strip().lower()
+        actions = declaration.get("actions")
+        requires = declaration.get("requires") or {}
+        if not system or not isinstance(actions, list) or not isinstance(requires, dict):
+            continue
+        required_mcp = requires.get("mcp_servers") or []
+        required_toolsets = requires.get("toolsets") or []
+        required_mcp_tools = requires.get("mcp_tools") or {}
+        required_env = requires.get("env") or []
+        if (
+            not isinstance(required_mcp, list)
+            or not isinstance(required_toolsets, list)
+            or not isinstance(required_mcp_tools, dict)
+            or not isinstance(required_env, list)
+        ):
+            continue
+
+        required_mcp_names = {str(server) for server in required_mcp}
+        required_mcp_names.update(str(server) for server in required_mcp_tools)
+        if any(server not in enabled_toolsets for server in required_mcp_names):
+            continue
+        if any(str(toolset) not in enabled_toolsets for toolset in required_toolsets):
+            continue
+        if any(str(key) not in available_secret_names for key in required_env):
+            continue
+
+        tools_available = True
+        for server, tool_names in required_mcp_tools.items():
+            server_name = str(server)
+            if not isinstance(tool_names, list):
+                tools_available = False
+                break
+            normalized_tools = {str(tool) for tool in tool_names if str(tool)}
+            available_tools = mcp_manifests.get(server_name)
+            if (
+                not normalized_tools
+                or available_tools is None
+                or not normalized_tools.issubset(available_tools)
+            ):
+                tools_available = False
+                break
+        if not tools_available:
+            continue
+
+        for action in actions:
+            normalized = str(action or "").strip().lower()
+            if normalized:
+                verified.add((system, normalized))
+    return sorted(verified)
+
+
+def find_capable_profiles(system: str, action: str) -> list[str]:
+    """Return profiles whose live config verifies a capability."""
+    target = (str(system).strip().lower(), str(action).strip().lower())
+    try:
+        names = {p.name for p in _get_profiles_root().iterdir() if p.is_dir()}
+    except OSError:
+        names = set()
+    if _get_default_hermes_home().is_dir():
+        names.add("default")
+    return [name for name in sorted(names) if target in get_profile_capabilities(name)]
+
+
 # ---------------------------------------------------------------------------
 # Alias / wrapper script management
 # ---------------------------------------------------------------------------

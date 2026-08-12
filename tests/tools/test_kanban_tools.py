@@ -400,6 +400,8 @@ def test_create_happy_path(worker_env):
     out = kt._handle_create({
         "title": "child task",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -510,6 +512,8 @@ def test_worker_lifecycle_through_tools(worker_env):
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
         "assignee": "qa",
+        "required_system": "code",
+        "required_action": "write",
         "parents": [worker_env],
     }))
     assert child_out["ok"]
@@ -942,6 +946,8 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     out = kt._handle_create({
         "title": "no sub gated",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -969,6 +975,8 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True, d
