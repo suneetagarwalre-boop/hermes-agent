@@ -1426,6 +1426,22 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    raw_required_system = args.get("required_system")
+    raw_required_action = args.get("required_action")
+    if raw_required_system is not None and not isinstance(raw_required_system, str):
+        return tool_error("'required_system' must be a non-empty string")
+    if raw_required_action is not None and not isinstance(raw_required_action, str):
+        return tool_error("'required_action' must be a non-empty string")
+    required_system = str(raw_required_system or "").strip().lower()
+    required_action = str(raw_required_action or "").strip().lower()
+    if not required_system and not required_action:
+        return tool_error(
+            "Actionable kanban cards require 'required_system' and "
+            "'required_action' so routing can be checked before a worker starts. "
+            "Answer status-only questions directly instead of creating a card."
+        )
+    if bool(required_system) != bool(required_action):
+        return tool_error("'required_system' and 'required_action' must be set together")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1476,6 +1492,9 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                required_system=required_system,
+                required_action=required_action,
+                require_capability_contract=True,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2175,6 +2194,23 @@ KANBAN_CREATE_SCHEMA = {
                     "reads this as part of its context."
                 ),
             },
+            "required_system": {
+                "type": "string",
+                "description": (
+                    "Structured system identifier for actionable work (for example "
+                    "'ghl_reside', 'content', 'calendar', 'code'). Set together with "
+                    "required_action so dispatch can verify the assignee's live, "
+                    "allowed capabilities. Do not create a card for a status-only reply."
+                ),
+            },
+            "required_action": {
+                "type": "string",
+                "description": (
+                    "Structured action requested in required_system (for example "
+                    "'read', 'write', 'draft', 'generate'). Set together with "
+                    "required_system; dispatch never guesses this from title keywords."
+                ),
+            },
             "parents": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2317,7 +2353,7 @@ KANBAN_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title", "assignee", "required_system", "required_action"],
     },
 }
 

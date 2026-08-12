@@ -993,6 +993,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Structured capability requested by the creator. Populated cards are
+    # checked against the selected profile immediately before claim/spawn.
+    required_system: Optional[str] = None
+    required_action: Optional[str] = None
+    # New cards require a structured capability contract.  The migration
+    # leaves this false for historical rows so deployment is fail-open only
+    # for cards that genuinely pre-date the gate.
+    capability_contract_required: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1086,6 +1094,17 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            required_system=(
+                row["required_system"] if "required_system" in keys else None
+            ),
+            required_action=(
+                row["required_action"] if "required_action" in keys else None
+            ),
+            capability_contract_required=(
+                bool(row["capability_contract_required"])
+                if "capability_contract_required" in keys
+                else False
             ),
         )
 
@@ -1274,7 +1293,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Structured request contract. NULL preserves legacy cards.
+    required_system      TEXT,
+    required_action      TEXT,
+    -- 0 on migrated rows; every newly created card writes 1.
+    capability_contract_required INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2473,6 +2497,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "required_system" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_system", "required_system TEXT")
+    if "required_action" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_action", "required_action TEXT")
+    if "capability_contract_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "capability_contract_required",
+            "capability_contract_required INTEGER NOT NULL DEFAULT 0",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2940,6 +2975,9 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    required_system: Optional[str] = None,
+    required_action: Optional[str] = None,
+    require_capability_contract: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2986,6 +3024,10 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    required_system = str(required_system or "").strip().lower() or None
+    required_action = str(required_action or "").strip().lower() or None
+    if bool(required_system) != bool(required_action):
+        raise ValueError("required_system and required_action must be provided together")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3157,12 +3199,28 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "SELECT id, required_system, required_action, "
+            "capability_contract_required FROM tasks "
+            "WHERE idempotency_key = ? AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            existing_contract = (
+                row["required_system"],
+                row["required_action"],
+                bool(row["capability_contract_required"]),
+            )
+            requested_contract = (
+                required_system,
+                required_action,
+                bool(require_capability_contract),
+            )
+            if existing_contract != requested_contract:
+                raise ValueError(
+                    "idempotency_key already belongs to a task with a different "
+                    "capability contract"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3254,8 +3312,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        required_system, required_action,
+                        capability_contract_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3281,6 +3341,9 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        required_system,
+                        required_action,
+                        1 if require_capability_contract else 0,
                     ),
                 )
                 for pid in parents:
@@ -7708,6 +7771,10 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    capability_rerouted: list[tuple[str, str, str, str, str]] = field(default_factory=list)
+    """``(task_id, old, new, system, action)`` reroutes verified before spawn."""
+    capability_blocked: list[str] = field(default_factory=list)
+    """Tasks stopped before claim because no unique verified profile matched."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9382,7 +9449,8 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, required_system, required_action, "
+        "capability_contract_required FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -9468,29 +9536,83 @@ def _dispatch_once_locked(
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
-                result.skipped_unassigned.append(row["id"])
-                continue
+                # A contracted unassigned card can still be routed safely when
+                # exactly one live profile verifies the requested capability.
+                # Legacy unassigned cards keep their historical parked state.
+                if not (
+                    row["capability_contract_required"]
+                    or (row["required_system"] and row["required_action"])
+                ):
+                    result.skipped_unassigned.append(row["id"])
+                    continue
+        # Capability gate: structured creator intent vs the selected profile's
+        # verified live config. Never infer from title/body keywords. A unique
+        # verified specialist may be substituted; ambiguity or unknown systems
+        # stop before claim/spawn with an operator-readable block. Run before
+        # the nonspawnable-lane check so a stale/wrong assignee cannot bypass a
+        # valid unique-specialist reroute.
+        required_system = row["required_system"]
+        required_action = row["required_action"]
+        contract_required = bool(row["capability_contract_required"])
+        if contract_required and not (required_system and required_action):
+            result.capability_blocked.append(row["id"])
+            if not dry_run:
+                reason = (
+                    "This task cannot start because its requested system and action "
+                    "were not recorded. Set both capability fields before dispatch."
+                )
+                add_comment(conn, row["id"], "dispatcher", reason)
+                block_task(conn, row["id"], reason=reason, kind="capability")
+            continue
+        if required_system and required_action:
+            from hermes_cli.profiles import find_capable_profiles, get_profile_capabilities
+
+            capability = (required_system, required_action)
+            if capability not in set(get_profile_capabilities(row_assignee)):
+                candidates = find_capable_profiles(required_system, required_action)
+                if len(candidates) == 1:
+                    replacement = candidates[0]
+                    if not dry_run:
+                        with write_txn(conn):
+                            updated = conn.execute(
+                                "UPDATE tasks SET assignee = ? WHERE id = ? "
+                                "AND status = 'ready' AND assignee IS ?",
+                                (replacement, row["id"], row_assignee),
+                            )
+                            if updated.rowcount != 1:
+                                continue
+                            _append_event(
+                                conn,
+                                row["id"],
+                                "capability_rerouted",
+                                {"from": row_assignee, "to": replacement,
+                                 "system": required_system, "action": required_action},
+                            )
+                    result.capability_rerouted.append(
+                        (row["id"], row_assignee, replacement, required_system, required_action)
+                    )
+                    row_assignee = replacement
+                else:
+                    result.capability_blocked.append(row["id"])
+                    if not dry_run:
+                        candidates_text = ", ".join(candidates) if candidates else "no verified specialist"
+                        reason = (
+                            f"This task cannot start because {row_assignee} is not configured and "
+                            f"allowed to {required_action} in {required_system}. I found "
+                            f"{candidates_text}; assign one verified specialist before dispatch."
+                        )
+                        add_comment(conn, row["id"], "dispatcher", reason)
+                        block_task(conn, row["id"], reason=reason, kind="capability")
+                    continue
+
         # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+        # Contracted cards have already had a chance to reroute above; legacy
+        # terminal lanes retain their historical pull-only behavior.
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -9542,6 +9664,41 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Close the config/claim race: the profile policy or tool surface can
+        # change after the ready-row check but before the claim commits. Re-read
+        # the claimed assignee's live capability immediately before workspace
+        # resolution and worker spawn; a mismatch is a real block, not a spawn
+        # failure to retry.
+        if claimed.capability_contract_required and not (
+            claimed.required_system and claimed.required_action
+        ):
+            reason = (
+                "This task cannot start because its requested system and action "
+                "were not recorded. Set both capability fields before dispatch."
+            )
+            add_comment(conn, claimed.id, "dispatcher", reason)
+            block_task(conn, claimed.id, reason=reason, kind="capability")
+            if claimed.id not in result.capability_blocked:
+                result.capability_blocked.append(claimed.id)
+            continue
+        if claimed.required_system and claimed.required_action:
+            from hermes_cli.profiles import get_profile_capabilities
+
+            claimed_capability = (claimed.required_system, claimed.required_action)
+            if claimed_capability not in set(
+                get_profile_capabilities(claimed.assignee or "")
+            ):
+                reason = (
+                    f"This task cannot start because {claimed.assignee or 'the assignee'} "
+                    f"is no longer configured and allowed to {claimed.required_action} "
+                    f"in {claimed.required_system}. Assign a verified specialist before "
+                    "dispatch."
+                )
+                add_comment(conn, claimed.id, "dispatcher", reason)
+                block_task(conn, claimed.id, reason=reason, kind="capability")
+                if claimed.id not in result.capability_blocked:
+                    result.capability_blocked.append(claimed.id)
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

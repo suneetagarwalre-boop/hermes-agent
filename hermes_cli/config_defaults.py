@@ -2404,6 +2404,13 @@ DEFAULT_CONFIG = {
         "reconcile_orphans": True,
     },
 
+    # Declarative work domains for pre-dispatch routing. Each entry names a
+    # system, allowed actions, and the live toolsets/MCP servers that must be
+    # present on this profile before the dispatcher may start it. Empty by
+    # default so legacy profiles/cards remain fail-open until explicitly
+    # configured.
+    "kanban_capabilities": [],
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:

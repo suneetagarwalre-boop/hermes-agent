@@ -84,6 +84,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
+        "required_system": t.required_system,
+        "required_action": t.required_action,
+        "capability_contract_required": t.capability_contract_required,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -343,6 +346,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument("--required-system", default=None,
+                          help="Structured system identifier for pre-dispatch capability validation")
+    p_create.add_argument("--required-action", default=None,
+                          help="Structured action in --required-system (both flags are required together)")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1566,6 +1573,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except BlankBodyError as exc:
         print(f"kanban create: {exc}", file=sys.stderr)
         return 2
+    required_system = str(getattr(args, "required_system", None) or "").strip().lower()
+    required_action = str(getattr(args, "required_action", None) or "").strip().lower()
+    if bool(required_system) != bool(required_action):
+        print(
+            "kanban create: --required-system and --required-action must be set together",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1590,6 +1605,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            required_system=required_system,
+            required_action=required_action,
+            require_capability_contract=bool(required_system and required_action),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2692,6 +2710,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "capability_rerouted": [
+                {
+                    "task_id": tid,
+                    "from": old,
+                    "to": new,
+                    "system": system,
+                    "action": action,
+                }
+                for (tid, old, new, system, action) in res.capability_rerouted
+            ],
+            "capability_blocked": res.capability_blocked,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2712,6 +2741,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    for tid, old, new, system, action in res.capability_rerouted:
+        print(f"Rerouted {tid}: {old} -> {new} ({system}/{action})")
+    if res.capability_blocked:
+        print(f"Blocked (capability mismatch): {', '.join(res.capability_blocked)}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

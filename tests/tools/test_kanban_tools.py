@@ -401,6 +401,8 @@ def test_create_happy_path(worker_env):
         "title": "child task",
         "body": "Implement the child task and report its verified result.",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -462,6 +464,8 @@ def test_create_allows_genuinely_omitted_triage_body(worker_env):
     out = json.loads(kt._handle_create({
         "title": "triage child task",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
         "parents": [worker_env],
         "triage": True,
     }))
@@ -569,6 +573,8 @@ def test_worker_lifecycle_through_tools(worker_env):
         "title": "write integration test",
         "body": "Write the integration test described by the parent handoff.",
         "assignee": "qa",
+        "required_system": "code",
+        "required_action": "write",
         "parents": [worker_env],
     }))
     assert child_out["ok"]
@@ -929,6 +935,8 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
         "title": "no sub gated",
         "body": "Create a valid task without an automatic subscription.",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -957,6 +965,8 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
         "title": "auto-sub tolerates add_notify_sub failure",
         "body": "Create this valid task even when notification setup fails.",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True, d
