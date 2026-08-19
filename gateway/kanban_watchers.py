@@ -217,7 +217,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "protocol_violation", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -572,6 +572,21 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
+                            )
+                        elif kind == "protocol_violation":
+                            diagnostic = ""
+                            if ev.payload and ev.payload.get("worker_log_excerpt"):
+                                excerpt = str(ev.payload["worker_log_excerpt"])
+                                # The producer already applies a tail-preserving
+                                # bound. Keep this field independent from the
+                                # generic outcome so the root-cause tail cannot
+                                # be truncated away by an error prefix.
+                                diagnostic = f"\nStartup diagnostic (untrusted): {excerpt}"
+                            msg = (
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker "
+                                f"exited rc=0 without completing or blocking the task; "
+                                f"dispatcher recorded a failure and will retry"
+                                f"{diagnostic}"
                             )
                         elif kind == "timed_out":
                             limit = 0

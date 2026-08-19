@@ -622,3 +622,40 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_delivers_protocol_violation_startup_diagnostic(tmp_path, monkeypatch):
+    """An rc=0 lifecycle violation must be visible immediately, not only after
+    the retry streak later gives up."""
+    db_path = tmp_path / "protocol-violation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="startup failure", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            "protocol_violation",
+            {
+                "exit_code": 0,
+                "protocol_violation": True,
+                "retry_status": "ready",
+                "worker_log_excerpt": "Error: invalid decimal literal",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "recorded a failure" in text
+    assert "invalid decimal literal" in text
+    assert "untrusted" in text

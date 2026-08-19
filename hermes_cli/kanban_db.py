@@ -8859,7 +8859,7 @@ def worker_exit_excerpt(
     *,
     board: Optional[str] = None,
     max_lines: int = 12,
-    max_chars: int = 700,
+    max_chars: int = 500,
 ) -> Optional[str]:
     """Return a compact excerpt of the tail of a worker's log, or None.
 
@@ -8882,6 +8882,22 @@ def worker_exit_excerpt(
         return None
     if not raw:
         return None
+    # This excerpt crosses a trust boundary: the raw log is board-local, but
+    # the excerpt is persisted in an event and may be rendered in chat/UI.
+    # Fail closed if the central sanitizers are unavailable rather than copy
+    # raw credentials or terminal-control bytes into those wider surfaces.
+    try:
+        from agent.redact import redact_sensitive_text
+        from tools.ansi_strip import sanitize_display_text, strip_unicode_tags
+
+        raw = redact_sensitive_text(
+            strip_unicode_tags(sanitize_display_text(raw)),
+            force=True,
+        )
+    except Exception:
+        return None
+    max_lines = max(1, int(max_lines))
+    max_chars = max(32, int(max_chars))
     lines: list[str] = []
     for line in raw.splitlines():
         stripped = line.strip().strip(_LOG_FRAME_CHARS).strip()
@@ -8901,7 +8917,11 @@ def worker_exit_excerpt(
     return excerpt
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -8989,9 +9009,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # is identical whether the worker did the work and skipped
                 # the paperwork or died on a startup error having done
                 # nothing — and those need opposite responses.
-                _excerpt = worker_exit_excerpt(row["id"])
-                if _excerpt:
-                    error_text += f" Worker log tail: {_excerpt}"
+                _excerpt = worker_exit_excerpt(row["id"], board=board)
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
@@ -9002,6 +9020,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
+                if _excerpt:
+                    # Keep the retry worker's run error generic. Raw/log-like
+                    # text must not be injected into its prompt through the
+                    # prior-attempt context. The sanitized diagnostic lives on
+                    # the operator-facing event instead.
+                    event_payload["worker_log_excerpt"] = _excerpt
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -10010,7 +10034,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
