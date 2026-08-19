@@ -1358,17 +1358,18 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
-    # The body IS the job spec — a worker handed a blank brief guesses. Reject
-    # null / empty / whitespace-only bodies and punctuation placeholders ('-',
-    # 'n/a', 'tbd') at CREATE time rather than letting a worker discover the
-    # gap at claim time. `triage` cards are the one designed no-body-yet path.
-    from hermes_cli.kanban_body_guard import BlankBodyError, validate_body
+    # Assigned specialist work must carry the compact five-field brief. The
+    # same validator runs again in the dispatcher so manual/legacy rows cannot
+    # bypass this creation gate.
+    from hermes_cli.kanban_body_guard import BriefValidationError, validate_body
 
     try:
         body = validate_body(
-            args.get("body"), allow_missing=bool(args.get("triage"))
+            args.get("body"),
+            require_structured=True,
+            title=str(title),
         )
-    except BlankBodyError as exc:
+    except BriefValidationError as exc:
         return tool_error(f"kanban_create: {exc}")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -2165,9 +2166,11 @@ KANBAN_CREATE_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": (
-                    "Opening post: full spec, acceptance criteria, "
-                    "links. The assigned worker reads this as part of "
-                    "its context."
+                    "Required compact work brief with labeled Action, "
+                    "Source (plus exact identifier when known), Scope "
+                    "including inclusions/exclusions, Acceptance check, "
+                    "and If absent handling. Blank, placeholder, title-only, "
+                    "and incomplete briefs are rejected before creation."
                 ),
             },
             "parents": {
@@ -2312,7 +2315,7 @@ KANBAN_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title", "body", "assignee"],
     },
 }
 

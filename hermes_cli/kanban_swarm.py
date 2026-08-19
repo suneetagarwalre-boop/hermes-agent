@@ -22,6 +22,7 @@ import sqlite3
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_body_guard import validate_body
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -229,6 +230,14 @@ def _create_swarm_uncommitted(
     for i, spec in enumerate(worker_specs, start=1):
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
+        try:
+            validate_body(
+                spec.body,
+                require_structured=True,
+                title=spec.title,
+            )
+        except ValueError as exc:
+            raise ValueError(f"workers[{i}].body: {exc}") from exc
 
     root = kb.create_task(
         conn,
@@ -285,9 +294,13 @@ def _create_swarm_uncommitted(
         worker_ids.append(worker_id)
 
     verifier_body = (
-        "Review every worker handoff and blackboard update. Gate the swarm: "
-        "complete only with metadata {\"gate\": \"pass\"} when evidence is "
-        "sufficient; otherwise block with exact missing work."
+        "Action: Review every worker handoff and blackboard update.\n"
+        f"Source: Swarm root {root} and all linked worker handoffs.\n"
+        "Scope: Include every worker output and its evidence; exclude new "
+        "implementation work.\n"
+        "Acceptance: Complete only with metadata {\"gate\": \"pass\"} when "
+        "the evidence is sufficient.\n"
+        "If absent: Block and name the exact missing worker output or evidence."
         + context_suffix
     )
     verifier = kb.create_task(
@@ -305,8 +318,13 @@ def _create_swarm_uncommitted(
     )
 
     synthesizer_body = (
-        "Synthesize the verified worker outputs into the final deliverable. "
-        "Do not start until the verifier has passed the gate."
+        "Action: Synthesize the verified worker outputs into the final deliverable.\n"
+        f"Source: Swarm root {root}, verifier task {verifier}, and linked handoffs.\n"
+        "Scope: Include only verifier-approved outputs; exclude unverified claims "
+        "and new implementation work.\n"
+        "Acceptance: Return the complete deliverable after the verifier records a "
+        "passing gate.\n"
+        "If absent: Block and report the missing verifier gate or worker handoff."
         + context_suffix
     )
     synthesizer = kb.create_task(
