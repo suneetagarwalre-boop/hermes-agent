@@ -625,10 +625,17 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        from hermes_cli.kanban_body_guard import validate_body
+
+        body_text = validate_body(
+            payload.body,
+            require_structured=bool(payload.assignee),
+            title=payload.title,
+        )
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
-            body=payload.body,
+            body=body_text,
             assignee=payload.assignee,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,

@@ -7,6 +7,17 @@ from hermes_cli.kanban_swarm import (
     latest_blackboard,
     post_blackboard_update,
 )
+from hermes_cli.kanban_body_guard import validate_body
+
+
+def _brief(action: str) -> str:
+    return (
+        f"Action: {action}\n"
+        "Source: The swarm goal and shared root blackboard.\n"
+        "Scope: Include the assigned analysis; exclude sibling work.\n"
+        "Acceptance: Post a complete evidence-backed handoff.\n"
+        "If absent: Block and name the missing source or context."
+    )
 
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
@@ -16,8 +27,16 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
             conn,
             goal="Map the target market and produce a decision memo.",
             workers=[
-                SwarmWorkerSpec(profile="researcher-a", title="Market scan", body="Find competitors"),
-                SwarmWorkerSpec(profile="researcher-b", title="Customer scan", body="Find customer pains"),
+                SwarmWorkerSpec(
+                    profile="researcher-a",
+                    title="Market scan",
+                    body=_brief("Find competitors."),
+                ),
+                SwarmWorkerSpec(
+                    profile="researcher-b",
+                    title="Customer scan",
+                    body=_brief("Find customer pains."),
+                ),
             ],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
@@ -44,6 +63,12 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
         assert all(created.root_id in (task.body or "") for task in workers)
+        for task in [*workers, verifier, synthesizer]:
+            assert validate_body(
+                task.body,
+                require_structured=True,
+                title=task.title,
+            ) == task.body
     finally:
         conn.close()
 
@@ -78,8 +103,8 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
                 writer,
                 goal="Build atomically",
                 workers=[
-                    SwarmWorkerSpec(profile="worker-a", title="A", body="A"),
-                    SwarmWorkerSpec(profile="worker-b", title="B", body="B"),
+                    SwarmWorkerSpec(profile="worker-a", title="A", body=_brief("A.")),
+                    SwarmWorkerSpec(profile="worker-b", title="B", body=_brief("B.")),
                 ],
                 verifier_assignee="reviewer",
                 synthesizer_assignee="writer",
@@ -99,7 +124,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
                 writer,
                 goal="Fail activation atomically",
                 workers=[
-                    SwarmWorkerSpec(profile="worker-a", title="A", body="A"),
+                    SwarmWorkerSpec(profile="worker-a", title="A", body=_brief("A.")),
                 ],
                 verifier_assignee="reviewer",
                 synthesizer_assignee="writer",
@@ -119,7 +144,9 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
         create_swarm(
             writer,
             goal="Commit before lifecycle hook",
-            workers=[SwarmWorkerSpec(profile="worker-a", title="A", body="A")],
+            workers=[
+                SwarmWorkerSpec(profile="worker-a", title="A", body=_brief("A."))
+            ],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
         )
@@ -183,7 +210,13 @@ def test_swarm_blackboard_merges_structured_updates(tmp_path):
         created = create_swarm(
             conn,
             goal="Collect evidence.",
-            workers=[SwarmWorkerSpec(profile="researcher", title="Evidence", body="Find proof")],
+            workers=[
+                SwarmWorkerSpec(
+                    profile="researcher",
+                    title="Evidence",
+                    body=_brief("Find proof."),
+                )
+            ],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
         )
@@ -218,8 +251,8 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             conn,
             goal="Research two branches then verify and synthesize.",
             workers=[
-                SwarmWorkerSpec(profile="a", title="Branch A", body="A"),
-                SwarmWorkerSpec(profile="b", title="Branch B", body="B"),
+                SwarmWorkerSpec(profile="a", title="Branch A", body=_brief("A.")),
+                SwarmWorkerSpec(profile="b", title="Branch B", body=_brief("B.")),
             ],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",

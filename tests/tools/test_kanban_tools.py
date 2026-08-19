@@ -15,6 +15,15 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+VALID_WORK_BRIEF = """\
+Action: Complete the synthetic child task.
+Source: This isolated Kanban test database and its parent task.
+Scope: Include the tested lifecycle; exclude external systems.
+Acceptance: The handler creates exactly one child with the expected fields.
+If absent: Fail the test because the parent task is missing.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -400,6 +409,7 @@ def test_create_happy_path(worker_env):
     out = kt._handle_create({
         "title": "child task",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -414,6 +424,22 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("body", [None, "-", "Action: Patch it."])
+def test_create_rejects_incomplete_work_brief_before_write(worker_env, body):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    args = {"title": "bad child", "assignee": "peer"}
+    if body is not None:
+        args["body"] = body
+    response = json.loads(kt._handle_create(args))
+
+    assert "error" in response
+    assert "work brief" in response["error"]
+    with kb.connect_closing() as conn:
+        assert all(task.title != "bad child" for task in kb.list_tasks(conn))
 
 
 def test_link_happy_path(worker_env):
@@ -510,6 +536,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
         "assignee": "qa",
+        "body": VALID_WORK_BRIEF,
         "parents": [worker_env],
     }))
     assert child_out["ok"]
@@ -942,6 +969,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     out = kt._handle_create({
         "title": "no sub gated",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -969,6 +997,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
     })
     d = json.loads(out)
     assert d["ok"] is True, d

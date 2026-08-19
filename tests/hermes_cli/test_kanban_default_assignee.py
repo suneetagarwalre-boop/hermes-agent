@@ -14,6 +14,15 @@ import tempfile
 import pytest
 
 
+VALID_WORK_BRIEF = """\
+Action: Exercise default-assignee dispatch behavior.
+Source: This isolated Kanban test database, task t1.
+Scope: Include assignment and spawn; exclude external worker processes.
+Acceptance: The expected assignee is recorded and the task is spawned once.
+If absent: Fail the test because task t1 is missing.
+"""
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
@@ -44,7 +53,9 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(
+            conn, title="t1", body=VALID_WORK_BRIEF, assignee=None
+        )
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
@@ -83,7 +94,9 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee="default")
+        task_id = kb.create_task(
+            conn, title="t1", body=VALID_WORK_BRIEF, assignee="default"
+        )
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,

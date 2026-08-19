@@ -4664,6 +4664,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    require_valid_brief: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4674,6 +4675,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if require_valid_brief:
+            brief_row = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            ).fetchone()
+            if brief_row is None or _work_brief_error(
+                brief_row["title"], brief_row["body"]
+            ) is not None:
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4786,6 +4796,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    require_valid_brief: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4802,6 +4813,15 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if require_valid_brief:
+            brief_row = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ? AND status = 'review'",
+                (task_id,),
+            ).fetchone()
+            if brief_row is None or _work_brief_error(
+                brief_row["title"], brief_row["body"]
+            ) is not None:
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -8072,6 +8092,10 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
+    rejected_incomplete_brief: list[tuple[str, str]] = field(default_factory=list)
+    """Ready/review tasks refused before spawn as ``(task_id, error)``.
+    The task stays queued so the router can repair the brief using the exact
+    missing-field message without losing its identity or dependency graph."""
     auto_assigned_default: list[str] = field(default_factory=list)
     """Task ids that were unassigned in the DB and had
     ``kanban.default_assignee`` applied this tick before spawning (#27145).
@@ -9664,6 +9688,17 @@ def check_respawn_guard(
     return None
 
 
+def _work_brief_error(title: Optional[str], body: Optional[str]) -> Optional[str]:
+    """Return the router-facing error for an undispatchable brief, if any."""
+    from hermes_cli.kanban_body_guard import BriefValidationError, validate_body
+
+    try:
+        validate_body(body, require_structured=True, title=title)
+    except BriefValidationError as exc:
+        return str(exc)
+    return None
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -9679,10 +9714,14 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT DISTINCT assignee, title, body FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
+    rows = [
+        row for row in rows
+        if _work_brief_error(row["title"], row["body"]) is None
+    ]
     if not rows:
         return False
     try:
@@ -9705,10 +9744,14 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT DISTINCT assignee, title, body FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
+    rows = [
+        row for row in rows
+        if _work_brief_error(row["title"], row["body"]) is None
+    ]
     if not rows:
         return False
     try:
@@ -10161,7 +10204,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, body FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10170,7 +10213,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, title, body FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10241,6 +10284,10 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        brief_error = _work_brief_error(row["title"], row["body"])
+        if brief_error is not None:
+            result.rejected_incomplete_brief.append((row["id"], brief_error))
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10354,7 +10401,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            require_valid_brief=True,
+        )
         if claimed is None:
             continue
         try:
@@ -10446,6 +10498,10 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        brief_error = _work_brief_error(row["title"], row["body"])
+        if brief_error is not None:
+            result.rejected_incomplete_brief.append((row["id"], brief_error))
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -10481,7 +10537,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            require_valid_brief=True,
+        )
         if claimed is None:
             continue
         try:

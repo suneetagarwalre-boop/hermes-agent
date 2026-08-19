@@ -28,6 +28,15 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+VALID_WORK_BRIEF = """\
+Action: Exercise the review-dispatch lifecycle.
+Source: This isolated Kanban test database and the task under test.
+Scope: Include implementation and review lanes; exclude external workers.
+Acceptance: The task follows the status and spawn assertions in this test.
+If absent: Fail the test because the task under test is missing.
+"""
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -383,7 +392,9 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
     import hermes_cli.profiles as profmod
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="park", assignee="worker")
+        tid = kb.create_task(
+            conn, title="park", body=VALID_WORK_BRIEF, assignee="worker"
+        )
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="done",
@@ -437,7 +448,12 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
 
     with kb.connect() as conn:
         # Review-lane task with a fresh PR comment.
-        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        review_id = kb.create_task(
+            conn,
+            title="review me",
+            body=VALID_WORK_BRIEF,
+            assignee="reviewer",
+        )
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
@@ -446,7 +462,12 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             expected_run_id=claimed.current_run_id,
         )
         # Ready-lane task with the same fresh PR comment.
-        ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        ready_id = kb.create_task(
+            conn,
+            title="already PRed",
+            body=VALID_WORK_BRIEF,
+            assignee="worker",
+        )
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
 
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
@@ -497,6 +518,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         task_id = kb.create_task(
             conn,
             title="domain review",
+            body=VALID_WORK_BRIEF,
             assignee="reviewer",
             skills=["domain-specific-review"],
         )
@@ -542,13 +564,20 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
     )
 
     with kb.connect() as conn:
-        running_id = kb.create_task(conn, title="already running", assignee="builder")
+        running_id = kb.create_task(
+            conn,
+            title="already running",
+            body=VALID_WORK_BRIEF,
+            assignee="builder",
+        )
         running = kb.claim_task(conn, running_id)
         assert running is not None
 
         review_ids: list[str] = []
         for title in ("review one", "review two"):
-            task_id = kb.create_task(conn, title=title, assignee="reviewer")
+            task_id = kb.create_task(
+                conn, title=title, body=VALID_WORK_BRIEF, assignee="reviewer"
+            )
             implementation = kb.claim_task(conn, task_id)
             assert implementation is not None
             assert kb.request_review(

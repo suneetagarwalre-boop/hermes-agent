@@ -334,7 +334,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
-    p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--body",
+        default=None,
+        help=(
+            "Required structured work brief; pass '-' to read it from stdin. "
+            "Include Action, Source, Scope, Acceptance, and If absent fields."
+        ),
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1589,7 +1596,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         body = _resolve_body(args.body)
         body = _validate_body(
-            body, allow_missing=bool(getattr(args, "triage", False))
+            body,
+            require_structured=bool(args.assignee),
+            title=args.title,
         )
     except BlankBodyError as exc:
         print(f"kanban create: {exc}", file=sys.stderr)
@@ -2714,6 +2723,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, ws) in res.spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
+            "rejected_incomplete_brief": [
+                {"task_id": tid, "error": error}
+                for tid, error in res.rejected_incomplete_brief
+            ],
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
@@ -2747,6 +2760,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    for tid, error in res.rejected_incomplete_brief:
+        print(f"Rejected before dispatch ({tid}): {error}")
     if res.skipped_per_profile_capped:
         for tid, who, current in res.skipped_per_profile_capped:
             print(

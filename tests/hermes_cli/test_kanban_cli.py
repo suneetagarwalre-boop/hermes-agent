@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import threading
 from pathlib import Path
 
@@ -138,9 +139,16 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
+    brief = """\
+Action: Simulate a worker that claims and then stalls.
+Source: This isolated Kanban test database, task created below.
+Scope: Include claim and reclaim; exclude real worker processes.
+Acceptance: Reclaim returns the task to ready.
+If absent: Fail the test because the task was not created.
+"""
     out1 = kc.run_slash(
         "create 'stuck worker task' --assignee broken-model "
-        "--body 'Simulate a worker that claims and then stalls.'"
+        f"--body {shlex.quote(brief)}"
     )
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m

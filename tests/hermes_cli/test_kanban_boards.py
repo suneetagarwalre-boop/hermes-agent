@@ -324,11 +324,19 @@ class TestCLI:
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
         # Create one task on each via --board.
+        brief_a = (
+            "Action: Verify task isolation on projA.\n"
+            "Source: Kanban board projA.\n"
+            "Scope: Include projA; exclude every other board.\n"
+            "Acceptance: The task is listed only on projA.\n"
+            "If absent: Report that projA is missing."
+        )
+        brief_b = brief_a.replace("projA", "projB")
         r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev",
-                  "--body", "Board isolation probe for projA."], env_extra=env)
+                  "--body", brief_a], env_extra=env)
         assert r.returncode == 0, r.stderr
         r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev",
-                  "--body", "Board isolation probe for projB."], env_extra=env)
+                  "--body", brief_b], env_extra=env)
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.

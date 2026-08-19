@@ -14,6 +14,15 @@ import tempfile
 import pytest
 
 
+VALID_WORK_BRIEF = """\
+Action: Exercise per-profile dispatcher capacity.
+Source: This isolated Kanban test database and its synthetic tasks.
+Scope: Include dry-run and real dispatch; exclude external worker processes.
+Acceptance: Spawn and deferred counts match the configured profile cap.
+If absent: Fail the test because the synthetic task is missing.
+"""
+
+
 @pytest.fixture()
 def isolated_kanban_home_with_profiles(monkeypatch):
     """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
@@ -41,9 +50,13 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(
+                conn, title=f"a{i}", body=VALID_WORK_BRIEF, assignee="alpha"
+            )
         for i in range(3):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            kb.create_task(
+                conn, title=f"b{i}", body=VALID_WORK_BRIEF, assignee="beta"
+            )
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -66,7 +79,12 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     kb = isolated_kanban_home_with_profiles
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
+        ids = [
+            kb.create_task(
+                conn, title=f"a{i}", body=VALID_WORK_BRIEF, assignee="alpha"
+            )
+            for i in range(3)
+        ]
 
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:
