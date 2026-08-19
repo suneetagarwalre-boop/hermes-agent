@@ -134,10 +134,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
-# Every Kanban card carries its own agent-loop budget. Sixty preserves the
-# historical worker default; 300 keeps the override useful for large tasks
+# Every Kanban card carries its own agent-loop budget. 100 replaces the
+# historical 60-turn worker default (2026-08-19): the Aug 9-19 audit showed
+# 30 stark runs dying at exactly 60/60 iterations, and 18 of those 28 tasks
+# completed on a full re-run — i.e. legit briefs were double-running to fit
+# a too-thin budget. 300 keeps the per-card override useful for large tasks
 # without letting a card disable the runaway backstop entirely.
-DEFAULT_TASK_MAX_TURNS = 60
+DEFAULT_TASK_MAX_TURNS = 100
 MAX_TASK_MAX_TURNS = 300
 
 
@@ -1376,7 +1379,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_runtime_seconds  INTEGER,
     -- Per-task agent-loop budget. The dispatcher always passes this value
     -- through as ``--max-turns``. The application bounds writes to 1..300.
-    max_turns            INTEGER NOT NULL DEFAULT 60,
+    max_turns            INTEGER NOT NULL DEFAULT 100,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -2610,7 +2613,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
         )
     if "max_turns" not in cols:
-        # Existing cards keep the historical 60-turn worker budget.
+        # Pre-existing DBs migrate with the current default budget.
         _add_column_if_missing(
             conn,
             "tasks",
@@ -3226,7 +3229,7 @@ def create_task(
     re-queues the task. ``None`` means no cap (default).
 
     ``max_turns`` is the worker's agent-loop iteration budget. ``None``
-    preserves the historical 60-turn default; values above 300 are rejected
+    preserves the default (``DEFAULT_TASK_MAX_TURNS``); values above 300 are rejected
     so the per-card knob cannot remove the runaway backstop.
 
     ``skills`` is an optional list of skill names to force-load into

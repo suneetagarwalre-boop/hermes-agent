@@ -2243,10 +2243,10 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 300,
-                "default": 60,
+                "default": 100,
                 "description": (
                     "Per-task agent iteration budget passed to the worker as "
-                    "--max-turns. Defaults to 60 and is capped at 300."
+                    "--max-turns. Defaults to 100 and is capped at 300."
                 ),
             },
             "initial_status": {
