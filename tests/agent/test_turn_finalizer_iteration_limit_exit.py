@@ -128,6 +128,29 @@ def _finalize(
 
 
 
+def test_human_gate_cap_is_a_completed_controlled_response(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=10, budget_remaining=0)
+    response = (
+        "Action: Complete MFA.\n"
+        "Path: https://example.com/mfa\n"
+        "Blocked: task cannot continue until MFA is complete."
+    )
+
+    result = _finalize(
+        agent,
+        final_response=response,
+        exit_reason="human_gate_iteration_cap",
+        api_call_count=10,
+    )
+
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == response
+    assert result["turn_exit_reason"] == "human_gate_iteration_cap"
+    assert agent._handle_max_iterations_called is False
+
+
 @pytest.mark.parametrize(
     ("exit_reason", "interrupted", "failed"),
     [

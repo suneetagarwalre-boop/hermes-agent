@@ -1017,6 +1017,70 @@ class TestSaveJobOutput:
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
 
+    def test_sixty_four_identical_outputs_reuse_one_file(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs
+
+        base = datetime(2026, 8, 12, 18, 0, 0)
+        stamps = iter(base + timedelta(seconds=i) for i in range(64))
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: next(stamps))
+
+        paths = [
+            save_job_output("c55d993433ba", "same result")
+            for _ in range(64)
+        ]
+
+        assert len(set(paths)) == 1
+        assert len(list(paths[0].parent.glob("*.md"))) == 1
+
+    def test_identical_output_still_runs_retention_prune(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs
+
+        save_job_output("retained", "same")
+        pruned = []
+        monkeypatch.setattr(
+            jobs,
+            "_prune_job_output",
+            lambda output_dir, keep: pruned.append((output_dir, keep)) or 0,
+        )
+
+        save_job_output("retained", "same")
+
+        assert len(pruned) == 1
+        assert pruned[0][0].name == "retained"
+
+    def test_invalid_utf8_previous_output_does_not_block_fresh_write(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        first = save_job_output("corrupt", "first")
+        first.write_bytes(b"\xff\xfe")
+        monkeypatch.setattr(
+            jobs,
+            "_hermes_now",
+            lambda: datetime(2026, 8, 12, 18, 2, 0),
+        )
+
+        fresh = save_job_output("corrupt", "fresh")
+
+        assert fresh != first
+        assert fresh.read_text(encoding="utf-8") == "fresh"
+
+    def test_changed_output_writes_new_file(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs
+
+        stamps = iter(["2026-08-12_18-00-00", "2026-08-12_18-02-00"])
+        monkeypatch.setattr(
+            jobs,
+            "_hermes_now",
+            lambda: datetime.strptime(next(stamps), "%Y-%m-%d_%H-%M-%S"),
+        )
+        first = save_job_output("real-signal", "one")
+        second = save_job_output("real-signal", "two")
+
+        assert second != first
+        assert sorted(p.read_text() for p in first.parent.glob("*.md")) == ["one", "two"]
+
 
 class TestCronOutputRetention:
     """Per-run cron output must self-prune so long deploys don't fill the disk (#52383)."""

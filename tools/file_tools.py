@@ -2268,7 +2268,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
-            if not result_dict.get("error"):
+            if not result_dict.get("error") and not result_dict.get("unchanged"):
                 _mark_verification_stale(task_id, [path], session_id=session_id)
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
@@ -2294,13 +2294,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # mismatch is visible in the response instead of silently routing
             # the edit to the wrong checkout.
             result_dict["resolved_path"] = _resolved
-            if not result_dict.get("error"):
+            if not result_dict.get("error") and not result_dict.get("unchanged"):
                 result_dict["files_modified"] = [_resolved]
                 _mark_verification_stale(task_id, [_resolved], session_id=session_id)
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
-            if not result_dict.get("error"):
+            if not result_dict.get("error") and not result_dict.get("unchanged"):
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:

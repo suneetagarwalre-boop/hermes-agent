@@ -480,6 +480,23 @@ class TestSearchFilesFallbackHiddenPaths:
 
 
 class TestShellFileOpsWriteDenied:
+    def test_identical_content_skips_atomic_write(self, tmp_path, monkeypatch):
+        target = tmp_path / "unchanged.txt"
+        target.write_text("same bytes\n", encoding="utf-8")
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+
+        def fail_write(*_args, **_kwargs):
+            pytest.fail("identical content must not reach _atomic_write")
+
+        monkeypatch.setattr(ops, "_atomic_write", fail_write)
+        result = ops.write_file(str(target), "same bytes\n")
+
+        assert result.error is None
+        assert result.unchanged is True
+        assert result.verified is True
+        assert result.bytes_written == 0
+        assert target.read_text(encoding="utf-8") == "same bytes\n"
+
     def test_write_file_denied_path(self, file_ops):
         result = file_ops.write_file("~/.ssh/authorized_keys", "evil key")
         assert result.error is not None

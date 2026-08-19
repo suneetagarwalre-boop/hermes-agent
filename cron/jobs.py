@@ -3519,11 +3519,29 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
 
 
 def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+    """Save output unless the newest retained file is byte-identical.
+
+    Returning the existing path preserves caller compatibility while preventing
+    high-frequency jobs from writing one identical file per tick.
+    """
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
+
+    try:
+        newest = max(
+            (path for path in job_output_dir.glob("*.md") if path.is_file()),
+            key=lambda path: path.name,
+            default=None,
+        )
+        if newest is not None and newest.read_text(encoding="utf-8") == output:
+            logger.info("Cron output unchanged; reusing %s", newest)
+            _prune_job_output(job_output_dir, _cron_output_keep())
+            return newest
+    except (OSError, UnicodeError):
+        # Comparison is an optimization, never a reason to lose fresh output.
+        logger.debug("Could not compare previous cron output", exc_info=True)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
