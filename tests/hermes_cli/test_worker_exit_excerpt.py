@@ -20,11 +20,11 @@ Query: work kanban task fbbbe3f2
 Initializing agent...
 ────────────
 
- ─  ⚕ Hermes  ────────────────────────────────────── 
-                                                                    
- Error: invalid decimal literal (conversation_loop.py, line 8589)    
-                                                                    
- ──────────────────────────────────────── 
+ ─  ⚕ Hermes  ──────────────────────────────────────
+
+ Error: invalid decimal literal (conversation_loop.py, line 8589)
+
+ ────────────────────────────────────────
 
 Goodbye! ⚕
 """
