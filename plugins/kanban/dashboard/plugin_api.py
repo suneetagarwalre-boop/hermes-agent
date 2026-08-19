@@ -629,7 +629,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
 
         body_text = validate_body(
             payload.body,
-            require_structured=bool(payload.assignee),
+            require_structured=True,
             title=payload.title,
         )
         task_id = kanban_db.create_task(

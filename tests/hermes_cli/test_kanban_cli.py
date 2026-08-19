@@ -94,9 +94,16 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     failures: list[str] = []
 
     def worker(board: str, title: str) -> None:
+        body = (
+            f"Action: Exercise concurrent create for board {board}.\n"
+            f"Source: Isolated Kanban board {board}.\n"
+            "Scope: Include only concurrent board creation; exclude external systems.\n"
+            "Acceptance: Exactly one task is created on the named board.\n"
+            "If absent: Fail because the isolated board is missing."
+        )
         args = parser.parse_args([
             "kanban", "--board", board, "create", title,
-            "--body", f"Concurrency probe for board {board}.",
+            "--body", body,
         ])
         rc = kc.kanban_command(args)
         if rc != 0:

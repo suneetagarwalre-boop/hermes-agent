@@ -10,6 +10,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[2]
+VALID_WORK_BRIEF = """Action: Create a task used to test CLI refusal status.
+Source: This isolated Kanban CLI test database.
+Scope: Include only the delegated-child mutation refusal; exclude external systems.
+Acceptance: The delegated child command exits nonzero with the expected error.
+If absent: Fail the test because the synthetic task is missing."""
 
 
 def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.CompletedProcess[str]:
@@ -43,7 +48,15 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
     home = tmp_path / "hermes"
     home.mkdir()
 
-    created = _run_hermes(home, "kanban", "create", "exit status probe", "--json")
+    created = _run_hermes(
+        home,
+        "kanban",
+        "create",
+        "exit status probe",
+        "--body",
+        VALID_WORK_BRIEF,
+        "--json",
+    )
     assert created.returncode == 0, created.stderr
     task_id = json.loads(created.stdout)["id"]
 

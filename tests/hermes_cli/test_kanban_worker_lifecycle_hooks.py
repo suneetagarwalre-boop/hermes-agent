@@ -27,6 +27,12 @@ WORKER_HOOKS = (
     "on_kanban_worker_stale_claim",
 )
 
+VALID_WORK_BRIEF = """Action: Exercise a worker lifecycle hook.
+Source: This isolated Kanban test database.
+Scope: Include only the observer behavior under test; exclude external systems.
+Acceptance: The expected lifecycle event and task state are observed.
+If absent: Fail the test because the synthetic task is missing."""
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -78,7 +84,9 @@ def test_dispatch_spawn_fires_worker_spawned(
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(
+            conn, title="t", assignee="alice", body=VALID_WORK_BRIEF
+        )
         result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
         assert any(row[0] == tid for row in result.spawned)
     finally:
@@ -164,7 +172,9 @@ def test_raising_callbacks_never_break_worker_lifecycle(
     try:
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="alice")
+            tid = kb.create_task(
+                conn, title="t", assignee="alice", body=VALID_WORK_BRIEF
+            )
             result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
 
@@ -201,7 +211,7 @@ def test_no_subscriber_short_circuits_worker_hooks(
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
     conn = kb.connect()
     try:
-        kb.create_task(conn, title="t", assignee="alice")
+        kb.create_task(conn, title="t", assignee="alice", body=VALID_WORK_BRIEF)
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 222)
     finally:
         conn.close()

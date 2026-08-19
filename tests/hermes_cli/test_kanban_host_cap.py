@@ -24,6 +24,13 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+VALID_WORK_BRIEF = """Action: Exercise dispatcher concurrency behavior.
+Source: This isolated Kanban test database.
+Scope: Include only the dispatcher behavior under test; exclude external systems.
+Acceptance: The asserted task count and state are observed.
+If absent: Fail the test because the synthetic task is missing."""
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -138,12 +145,14 @@ def test_max_in_progress_counts_other_boards(
     # Two workers already running on the second board.
     with kb.connect(board="second") as conn:
         for title in ("busy-1", "busy-2"):
-            tid = kb.create_task(conn, title=title, assignee="alice")
+            tid = kb.create_task(conn, title=title, assignee="alice", body=VALID_WORK_BRIEF)
             assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
     with kb.connect() as conn:
-        kb.create_task(conn, title="wants-to-run", assignee="alice")
+        kb.create_task(
+            conn, title="wants-to-run", assignee="alice", body=VALID_WORK_BRIEF
+        )
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -159,13 +168,15 @@ def test_max_in_progress_partial_budget_across_boards(
     kb.create_board("second")
 
     with kb.connect(board="second") as conn:
-        tid = kb.create_task(conn, title="busy", assignee="alice")
+        tid = kb.create_task(
+            conn, title="busy", assignee="alice", body=VALID_WORK_BRIEF
+        )
         assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
     with kb.connect() as conn:
         for title in ("a", "b", "c"):
-            kb.create_task(conn, title=title, assignee="alice")
+            kb.create_task(conn, title=title, assignee="alice", body=VALID_WORK_BRIEF)
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -190,12 +201,14 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")
     with kb.connect(board="second") as conn:
-        tid = kb.create_task(conn, title="busy", assignee="alice")
+        tid = kb.create_task(
+            conn, title="busy", assignee="alice", body=VALID_WORK_BRIEF
+        )
         assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
     with kb.connect() as conn:
-        kb.create_task(conn, title="a", assignee="alice")
+        kb.create_task(conn, title="a", assignee="alice", body=VALID_WORK_BRIEF)
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_spawn=1,
         )
@@ -211,7 +224,9 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+    tid = kb.create_task(
+        conn, title=title, assignee=assignee, body=VALID_WORK_BRIEF
+    )
     _set_task_status(conn, tid, "review")
     return tid
 
@@ -228,7 +243,7 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     spawns: list = []
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
-            kb.create_task(conn, title=title, assignee="alice")
+            kb.create_task(conn, title=title, assignee="alice", body=VALID_WORK_BRIEF)
         review_id = _park_in_review(conn, "review-me", "reviewer")
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
@@ -252,7 +267,7 @@ def test_review_reservation_released_when_no_review_work(
     spawns: list = []
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
-            kb.create_task(conn, title=title, assignee="alice")
+            kb.create_task(conn, title=title, assignee="alice", body=VALID_WORK_BRIEF)
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -280,7 +295,7 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     spawns: list = []
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2"):
-            kb.create_task(conn, title=title, assignee="alice")
+            kb.create_task(conn, title=title, assignee="alice", body=VALID_WORK_BRIEF)
         _park_in_review(conn, "human-review", "some-human")
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
@@ -302,7 +317,9 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     spawns: list = []
     with kb.connect() as conn:
-        kb.create_task(conn, title="ready-1", assignee="alice")
+        kb.create_task(
+            conn, title="ready-1", assignee="alice", body=VALID_WORK_BRIEF
+        )
         for i in range(3):
             _park_in_review(conn, f"review-{i}", "reviewer")
         res = kb.dispatch_once(

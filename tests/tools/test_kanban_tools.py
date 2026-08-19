@@ -461,7 +461,9 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="blocked", assignee="worker")
+        tid = kb.create_task(
+            conn, title="blocked", body=VALID_WORK_BRIEF, assignee="worker"
+        )
         kb.block_task(conn, tid, reason="waiting")
     finally:
         conn.close()
@@ -493,8 +495,16 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        parent = kb.create_task(
+            conn, title="parent", body=VALID_WORK_BRIEF, assignee="worker"
+        )
+        child = kb.create_task(
+            conn,
+            title="child",
+            body=VALID_WORK_BRIEF,
+            assignee="worker",
+            parents=[parent],
+        )
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
         conn.commit()
     finally:
@@ -880,6 +890,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub gateway",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -914,6 +925,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub tui",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -940,6 +952,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "no sub cli",
         "assignee": "peer",
+        "body": VALID_WORK_BRIEF,
     })
     d = json.loads(out)
     assert d["ok"] is True

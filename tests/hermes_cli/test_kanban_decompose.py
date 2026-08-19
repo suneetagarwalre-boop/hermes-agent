@@ -17,6 +17,16 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
 
 
+def _brief(action: str) -> str:
+    return (
+        f"Action: {action}\n"
+        "Source: The root triage card and its isolated test database.\n"
+        "Scope: Include the assigned child work; exclude sibling work.\n"
+        "Acceptance: Return the completed child handoff with evidence.\n"
+        "If absent: Block and report the missing root context."
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -83,8 +93,8 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {"title": "research", "body": _brief("Research the request."), "assignee": "researcher", "parents": []},
+            {"title": "build", "body": _brief("Build the request."), "assignee": "engineer", "parents": [0]},
         ],
     })
 
@@ -121,7 +131,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         "fanout": False,
         "rationale": "single unit",
         "title": "Tightened title",
-        "body": "Route to fallback.",
+        "body": _brief("Route the request to the fallback worker."),
         "assignee": "made_up",
     })
 
@@ -143,6 +153,36 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.assignee == "fallback"
+
+
+def test_decompose_rejects_incomplete_generated_brief_before_child_write(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reject vague child", triage=True)
+
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test invalid child",
+        "tasks": [
+            {"title": "vague", "body": "do it", "assignee": "worker", "parents": []},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "worker"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "tasks[0].body is incomplete" in outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        tasks = kb.list_tasks(conn, limit=100)
+    assert root is not None and root.status == "triage"
+    assert [task.id for task in tasks] == [tid]
 
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):

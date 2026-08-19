@@ -45,6 +45,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_body_guard import BriefValidationError, validate_body
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ Output a single JSON object with this exact shape:
     "tasks": [
       {
         "title": "<concrete task title, imperative voice, <= 80 chars>",
-        "body":  "<detailed spec for the worker on this child task>",
+        "body":  "<five-field work brief described below>",
         "assignee": "<profile name from the roster, or null for default>",
         "parents": [<int>, ...]
       },
@@ -88,7 +89,10 @@ Rules:
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
-    context — be specific about goal, approach, and acceptance criteria.
+    context. Use these exact Markdown fields, each with a substantive value:
+    Action; Source (include the exact identifier when known); Scope (state
+    inclusions and exclusions); Acceptance; If absent (what to do when the
+    source cannot be found).
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -97,7 +101,7 @@ return:
     "fanout": false,
     "rationale": "<one sentence>",
     "title": "<tightened title>",
-    "body":  "<concrete spec for a single worker>",
+    "body":  "<the same five-field work brief required above>",
     "assignee": "<profile name from the roster, or null for default>"
   }
 
@@ -361,6 +365,16 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
+        try:
+            body_val = validate_body(
+                body_val,
+                require_structured=True,
+                title=title_val or task.title,
+            )
+        except BriefValidationError as exc:
+            return DecomposeOutcome(
+                task_id, False, f"decomposer returned an incomplete work brief: {exc}",
+            )
         with kb.connect_closing() as conn:
             ok = kb.specify_triage_task(
                 conn,
@@ -401,6 +415,16 @@ def decompose_task(
         body = entry.get("body")
         if not isinstance(body, str):
             body = ""
+        try:
+            body = validate_body(
+                body,
+                require_structured=True,
+                title=title,
+            ) or ""
+        except BriefValidationError as exc:
+            return DecomposeOutcome(
+                task_id, False, f"tasks[{idx}].body is incomplete: {exc}",
+            )
         assignee = entry.get("assignee")
         chosen = _normalize_assignee_choice(
             assignee,

@@ -143,6 +143,7 @@ def test_create_task_rejects_missing_work_brief(client):
     assert all(not column["tasks"] for column in board["columns"])
 
 
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -346,17 +347,21 @@ def test_reopening_parent_demotes_ready_child(client):
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="parent", assignee="planner")
+        parent_id = kb.create_task(
+            conn, title="parent", body=VALID_WORK_BRIEF, assignee="planner"
+        )
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
             conn,
             title="child in review",
+            body=VALID_WORK_BRIEF,
             assignee="reviewer",
             parents=[parent_id],
         )
         grandchild_id = kb.create_task(
             conn,
             title="downstream",
+            body=VALID_WORK_BRIEF,
             assignee="writer",
             parents=[child_id],
         )
@@ -464,7 +469,9 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        task_id = kb.create_task(
+            conn, title="active review", body=VALID_WORK_BRIEF, assignee="reviewer"
+        )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
@@ -700,8 +707,8 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
 
 
 def test_bulk_status_done_forwards_completion_summary(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json=_task_payload("a")).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json=_task_payload("b")).json()["task"]
 
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
@@ -731,7 +738,7 @@ def test_bulk_status_done_forwards_completion_summary(client):
 
 def test_bulk_status_running_rejected(client):
     """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json=_task_payload("x")).json()["task"]
 
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
@@ -821,7 +828,7 @@ def test_dashboard_cancel_keeps_task_in_old_status(client):
     relies on.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json=_task_payload("x")).json()["task"]
     # Tasks land in ``ready`` by default. No PATCH issued — simulating the
     # cancel branch in the bundle.
     assert t["status"] == "ready"
@@ -839,7 +846,7 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
     This is the contract the bundle's performMoveTask relies on.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json=_task_payload("x")).json()["task"]
     # Bundle's performMoveTask on confirm with a summary produces:
     #   { status, result: summary, summary: summary }
     r = client.patch(
@@ -858,7 +865,7 @@ def test_dashboard_confirm_dispatches_expected_delete(client):
     succeed and remove the task.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json=_task_payload("x")).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200, r.text
     # 404 on the now-deleted task confirms removal.
@@ -921,8 +928,8 @@ def test_dashboard_dependency_selects_use_value_change_handler():
 
 
 def test_bulk_archive(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json=_task_payload("a")).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json=_task_payload("b")).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"]], "archive": True})
     assert r.status_code == 200
@@ -936,9 +943,9 @@ def test_bulk_archive(client):
 
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "a", "assignee": "old"}).json()["task"]
+                    json=_task_payload("a", assignee="old")).json()["task"]
     b = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "b", "assignee": "old"}).json()["task"]
+                    json=_task_payload("b", assignee="old")).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"]], "assignee": "new"})
     assert r.status_code == 200
@@ -949,7 +956,7 @@ def test_bulk_reassign(client):
 
 def test_bulk_unassign_via_empty_string(client):
     a = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "a", "assignee": "x"}).json()["task"]
+                    json=_task_payload("a", assignee="x")).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"]], "assignee": ""})
     assert r.status_code == 200
@@ -960,8 +967,8 @@ def test_bulk_unassign_via_empty_string(client):
 def test_bulk_partial_failure_doesnt_abort_siblings(client):
     """One bad id in the middle of a batch must not prevent others from
     applying."""
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json=_task_payload("a")).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json=_task_payload("c")).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], "bogus-id", c2["id"]], "priority": 7})
     assert r.status_code == 200
@@ -1168,7 +1175,9 @@ def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="task", assignee="orig")
+        t = kb.create_task(
+            conn, title="task", assignee="orig", body=VALID_WORK_BRIEF
+        )
     finally:
         conn.close()
 

@@ -85,6 +85,16 @@ def test_title_only_card_is_rejected_before_db_write(kanban_home):
     assert _tasks() == []
 
 
+def test_unassigned_action_card_still_requires_structured_brief(kanban_home):
+    output = kanban_cli.run_slash(
+        "create 'unassigned action' --body 'Investigate this request.'"
+    )
+
+    assert "The work brief is incomplete" in output
+    assert "source/system and exact identifier when known" in output
+    assert _tasks() == []
+
+
 @pytest.mark.parametrize("body", ["-", "tbd", "placeholder", "   "])
 def test_placeholder_body_is_rejected_before_db_write(
     kanban_home, monkeypatch: pytest.MonkeyPatch, body: str

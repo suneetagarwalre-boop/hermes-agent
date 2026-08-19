@@ -405,4 +405,13 @@ def parse_worker_arg(raw: str) -> SwarmWorkerSpec:
     skills: list[str] = []
     if len(parts) == 3 and parts[2]:
         skills = [s.strip() for s in parts[2].split(",") if s.strip()]
-    return SwarmWorkerSpec(profile=parts[0], title=parts[1], body=parts[1], skills=skills)
+    title = parts[1]
+    body = (
+        f"Action: {title}.\n"
+        "Source: The swarm goal and root blackboard created for this worker.\n"
+        "Scope: Include this worker's assigned contribution; exclude sibling, "
+        "verification, and synthesis work.\n"
+        "Acceptance: Post a complete evidence-backed handoff for the verifier.\n"
+        "If absent: Block and name the missing swarm goal or root context."
+    )
+    return SwarmWorkerSpec(profile=parts[0], title=title, body=body, skills=skills)

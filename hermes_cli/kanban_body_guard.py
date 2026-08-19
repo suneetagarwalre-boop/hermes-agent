@@ -73,6 +73,13 @@ PLACEHOLDER_BODIES = frozenset(
         "no description",
         "placeholder",
         "unknown",
+        "do it",
+        "fix it",
+        "handle it",
+        "work on it",
+        "same",
+        "see above",
+        "as above",
     }
 )
 
@@ -113,10 +120,26 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 _STATUS_QUERY_RE = re.compile(
-    r"^(?:(?:what(?:'s|\s+is)\s+the\s+status\s+(?:of|for)|"
-    r"status\s+(?:of|for)|show\s+(?:me\s+)?the\s+status\s+(?:of|for))"
-    r"\s+(?:(?:task|card|job)\s+)?\S+|"
-    r"is\s+(?:task|card|job)\s+\S+\s+(?:done|complete|blocked|running))$",
+    r"^(?:(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:"
+    r"what(?:'s|\s+is)\s+the\s+status(?:\s+(?:of|for))?|"
+    r"(?:check|get|show(?:\s+me)?|tell\s+me)\s+(?:the\s+)?status(?:\s+(?:of|for))?|"
+    r"status(?:\s+(?:of|for))?"
+    r")\s+(?:(?:task|card|job)\s+)?\S+|"
+    r"(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+    r"(?:where\s+is|what\s+happened\s+to)\s+"
+    r"(?:(?:task|card|job)\s+)?\S+|"
+    r"(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?check\s+whether\s+"
+    r"(?:(?:task|card|job)\s+)?\S+\s+is\s+"
+    r"(?:done|complete|completed|blocked|running|ready|in\s+review|todo|triage)|"
+    r"is\s+(?:(?:task|card|job)\s+)?\S+\s+"
+    r"(?:done|complete|completed|blocked|running|ready|in\s+review|todo|triage))$",
+    re.IGNORECASE,
+)
+
+_SCOPE_INCLUDE_RE = re.compile(r"\b(?:include[sd]?|in[ -]?scope|only)\b", re.IGNORECASE)
+_SCOPE_EXCLUDE_RE = re.compile(r"\b(?:exclude[sd]?|out[ -]?of[ -]?scope|do not|don't)\b", re.IGNORECASE)
+_PLACEHOLDER_VALUE_RE = re.compile(
+    r"^(?:tbd|tba|todo|unknown|none|null|nil|n/?a|n\.a\.|placeholder)\b",
     re.IGNORECASE,
 )
 
@@ -129,6 +152,8 @@ def is_placeholder_body(body: Optional[str]) -> bool:
     if not stripped:
         return True
     if stripped.casefold() in PLACEHOLDER_BODIES:
+        return True
+    if _PLACEHOLDER_VALUE_RE.match(stripped):
         return True
     if not any(ch.isalnum() for ch in stripped):
         return True
@@ -180,7 +205,11 @@ def resolve_body(body: Optional[str], *, stdin=None) -> Optional[str]:
 
 
 def _label_pattern(label: str) -> str:
-    words = [re.escape(part) for part in label.split()]
+    words = [
+        re.escape(part)
+        for part in re.split(r"[\s_/-]+", label)
+        if part
+    ]
     return r"[\s_/-]+".join(words)
 
 
@@ -194,7 +223,7 @@ def _extract_structured_fields(body: str) -> dict[str, str]:
     labels = "|".join(_label_pattern(alias) for alias, _ in alias_to_field)
     matcher = re.compile(
         rf"^\s*(?:[-*+]\s*)?(?:#{{1,6}}\s*)?(?P<label>{labels})\s*"
-        rf"(?::|—|-)?\s*(?P<value>.*)$",
+        rf"(?:(?::|—)\s*|\s+-\s+|(?=\s*$))(?P<value>.*)$",
         re.IGNORECASE,
     )
     alias_lookup = {
@@ -230,11 +259,18 @@ def _extract_structured_fields(body: str) -> dict[str, str]:
 
 def _missing_structured_fields(body: str) -> tuple[str, ...]:
     fields = _extract_structured_fields(body)
-    return tuple(
-        field
-        for field in _FIELD_ALIASES
-        if field not in fields or is_placeholder_body(fields[field])
-    )
+    missing: list[str] = []
+    for field in _FIELD_ALIASES:
+        value = fields.get(field)
+        if value is None or is_placeholder_body(value):
+            missing.append(field)
+            continue
+        if field == "scope, including inclusions and exclusions" and (
+            _SCOPE_INCLUDE_RE.search(value) is None
+            or _SCOPE_EXCLUDE_RE.search(value) is None
+        ):
+            missing.append(field)
+    return tuple(missing)
 
 
 def validate_body(

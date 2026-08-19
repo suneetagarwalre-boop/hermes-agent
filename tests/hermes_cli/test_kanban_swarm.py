@@ -5,6 +5,7 @@ from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
     create_swarm,
     latest_blackboard,
+    parse_worker_arg,
     post_blackboard_update,
 )
 from hermes_cli.kanban_body_guard import validate_body
@@ -18,6 +19,19 @@ def _brief(action: str) -> str:
         "Acceptance: Post a complete evidence-backed handoff.\n"
         "If absent: Block and name the missing source or context."
     )
+
+
+def test_cli_worker_argument_builds_dispatchable_brief():
+    spec = parse_worker_arg("researcher:Map competitors:web-search")
+
+    assert spec.profile == "researcher"
+    assert spec.title == "Map competitors"
+    assert spec.skills == ["web-search"]
+    assert validate_body(
+        spec.body,
+        require_structured=True,
+        title=spec.title,
+    ) == spec.body
 
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):

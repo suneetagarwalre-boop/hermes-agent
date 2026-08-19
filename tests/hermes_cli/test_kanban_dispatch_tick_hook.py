@@ -20,6 +20,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
 
+VALID_WORK_BRIEF = """Action: Exercise the dispatch tick hook.
+Source: This isolated Kanban test database.
+Scope: Include only the observer behavior under test; exclude external systems.
+Acceptance: The expected hook event is captured.
+If absent: Fail the test because the synthetic task is missing."""
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -50,7 +57,9 @@ def test_active_tick_fires_hook_with_outcome_ok(
     """A tick that spawns a worker fires the hook with outcome='ok'."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(
+            conn, title="t", assignee="alice", body=VALID_WORK_BRIEF
+        )
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
     finally:
         conn.close()

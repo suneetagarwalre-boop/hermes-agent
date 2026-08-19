@@ -1592,12 +1592,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
     # The body IS the job spec. `--body -` is the shell "read from stdin"
     # idiom; honour it (heredocs are how long briefs get passed) instead of
     # storing a literal dash, then refuse anything that still carries no
-    # instruction. `--triage` is the one legitimate no-body-yet path.
+    # instruction. Every created card needs the same compact brief; triage is
+    # a routing state, not permission to create title-only work.
     try:
         body = _resolve_body(args.body)
         body = _validate_body(
             body,
-            require_structured=bool(args.assignee),
+            require_structured=True,
             title=args.title,
         )
     except BlankBodyError as exc:

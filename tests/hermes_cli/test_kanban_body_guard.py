@@ -60,6 +60,10 @@ Stop and report the missing repository path; do not invent a replacement.
         "(empty)",
         "no body",
         "placeholder",
+        "TBD later",
+        "unknown for now",
+        "do it",
+        "see above",
         "***",
         "___",
     ],
@@ -89,6 +93,51 @@ Acceptance: Run the focused test.
     assert "what to do if the source is absent" in error
     assert "requested action" not in exc_info.value.missing
     assert "acceptance check" not in exc_info.value.missing
+
+
+def test_scope_must_name_both_inclusions_and_exclusions():
+    body = VALID_CONTENT_BRIEF.replace(
+        "Scope: Include subject, preview, and body; exclude SMS and landing-page copy.",
+        "Scope: Draft the launch email.",
+    )
+    with pytest.raises(BriefValidationError) as exc_info:
+        validate_body(body, require_structured=True)
+
+    assert "scope, including inclusions and exclusions" in exc_info.value.missing
+
+
+def test_field_names_cannot_be_smuggled_as_word_prefixes():
+    body = """\
+Actionable change
+Sourcebook repository
+Scopeguard include code; exclude docs
+Acceptanceworthy test
+If absentmindedly stop
+"""
+    with pytest.raises(BriefValidationError) as exc_info:
+        validate_body(body, require_structured=True)
+
+    assert exc_info.value.missing
+
+
+def test_placeholder_only_structured_values_are_rejected():
+    body = """\
+Action: TBD later
+Source: unknown for now
+Scope: TODO include and exclude later
+Acceptance: placeholder pending
+If absent: TBD
+"""
+    with pytest.raises(BriefValidationError) as exc_info:
+        validate_body(body, require_structured=True)
+
+    assert set(exc_info.value.missing) == {
+        "requested action",
+        "source/system and exact identifier when known",
+        "scope, including inclusions and exclusions",
+        "acceptance check",
+        "what to do if the source is absent",
+    }
 
 
 def test_unassigned_draft_still_needs_real_body_but_not_structured_labels():
@@ -121,8 +170,19 @@ def test_dash_on_tty_fails_loudly():
         resolve_body("-", stdin=Tty(""))
 
 
-def test_simple_status_query_is_explicitly_no_card_work():
-    title = "What's the status of task t_44ad6ec3?"
+@pytest.mark.parametrize(
+    "title",
+    [
+        "What's the status of task t_44ad6ec3?",
+        "status t_44ad6ec3",
+        "check status of task t_44ad6ec3",
+        "where is card t_44ad6ec3?",
+        "is t_44ad6ec3 in review?",
+        "Can you check the status of task t_44ad6ec3?",
+        "Could you please check whether task t_44ad6ec3 is done?",
+    ],
+)
+def test_simple_status_query_is_explicitly_no_card_work(title):
     assert is_no_card_status_query(title, None) is True
     with pytest.raises(BriefValidationError, match="Answer it directly"):
         validate_body(None, title=title)
