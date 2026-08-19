@@ -103,6 +103,12 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+# Every Kanban card carries its own agent-loop budget. Sixty preserves the
+# historical worker default; 300 keeps the override useful for large tasks
+# without letting a card disable the runaway backstop entirely.
+DEFAULT_TASK_MAX_TURNS = 60
+MAX_TASK_MAX_TURNS = 300
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -764,6 +770,7 @@ class Task:
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    max_turns: int = DEFAULT_TASK_MAX_TURNS
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
@@ -849,6 +856,11 @@ class Task:
             ),
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+            ),
+            max_turns=(
+                int(row["max_turns"])
+                if "max_turns" in keys and row["max_turns"] is not None
+                else DEFAULT_TASK_MAX_TURNS
             ),
             last_heartbeat_at=(
                 row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
@@ -999,6 +1011,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
+    -- Per-task agent-loop budget. The dispatcher always passes this value
+    -- through as ``--max-turns``. The application bounds writes to 1..300.
+    max_turns            INTEGER NOT NULL DEFAULT 60,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -1637,6 +1652,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
         )
+    if "max_turns" not in cols:
+        # Existing cards keep the historical 60-turn worker budget.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "max_turns",
+            f"max_turns INTEGER NOT NULL DEFAULT {DEFAULT_TASK_MAX_TURNS}",
+        )
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
@@ -2065,6 +2088,7 @@ def create_task(
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
+    max_turns: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
@@ -2090,6 +2114,10 @@ def create_task(
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
     re-queues the task. ``None`` means no cap (default).
 
+    ``max_turns`` is the worker's agent-loop iteration budget. ``None``
+    preserves the historical 60-turn default; values above 300 are rejected
+    so the per-card knob cannot remove the runaway backstop.
+
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
     each name to ``hermes --skills ...`` alongside the built-in
@@ -2114,6 +2142,18 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+
+    if max_turns is None:
+        task_max_turns = DEFAULT_TASK_MAX_TURNS
+    else:
+        try:
+            task_max_turns = int(max_turns)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_turns must be an integer") from exc
+    if not 1 <= task_max_turns <= MAX_TASK_MAX_TURNS:
+        raise ValueError(
+            f"max_turns must be between 1 and {MAX_TASK_MAX_TURNS}"
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2236,8 +2276,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_turns, skills, max_retries, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2254,6 +2294,7 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                        task_max_turns,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
@@ -6743,6 +6784,7 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    cmd.extend(["--max-turns", str(task.max_turns)])
     cmd.extend([
         "chat",
         "-q", prompt,

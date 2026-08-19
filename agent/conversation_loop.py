@@ -4492,14 +4492,21 @@ def run_conversation(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
+                    _task_row = _kb.get_task(_conn, _kanban_task)
+                    _task_work = (
+                        _task_row.title.strip()
+                        if _task_row is not None and _task_row.title.strip()
+                        else _kanban_task
+                    )
                     _kb._record_task_failure(
                         _conn,
                         _kanban_task,
                         error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
+                            f"Iteration budget exhausted while working on "
+                            f"{_task_work!r}: used {api_call_count} of "
+                            f"{agent.max_iterations} iterations (task budget "
+                            f"{agent.max_iterations}). Raise max_turns or split "
+                            "the task into a smaller scope."
                         ),
                         outcome="timed_out",
                         release_claim=True,
