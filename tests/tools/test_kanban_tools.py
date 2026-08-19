@@ -857,6 +857,8 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub gateway",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -891,6 +893,8 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub tui",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -917,6 +921,8 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "no sub cli",
         "assignee": "peer",
+        "required_system": "code",
+        "required_action": "write",
     })
     d = json.loads(out)
     assert d["ok"] is True
