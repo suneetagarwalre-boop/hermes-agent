@@ -354,6 +354,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
+    p_create.add_argument("--max-turns", type=int, default=None,
+                          metavar="N", dest="max_turns",
+                          help="Per-task agent iteration budget passed to the "
+                               "worker as --max-turns (default "
+                               f"{kb.DEFAULT_TASK_MAX_TURNS}, capped at "
+                               f"{kb.MAX_TASK_MAX_TURNS}). Raise it for large "
+                               "briefs that legitimately need more tool calls.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -1554,6 +1561,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    max_turns = getattr(args, "max_turns", None)
+    if max_turns is not None and not 1 <= max_turns <= kb.MAX_TASK_MAX_TURNS:
+        print(
+            f"kanban: --max-turns must be between 1 and "
+            f"{kb.MAX_TASK_MAX_TURNS} (got {max_turns})",
+            file=sys.stderr,
+        )
+        return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -1579,6 +1594,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
+            max_turns=getattr(args, "max_turns", None),
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
