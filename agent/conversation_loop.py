@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.human_gate_guard import HumanGateGuard
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -1857,6 +1858,9 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    # Human-only gates get their own lower hard stop. This state is per user
+    # turn: a later turn after Suneet clears the wall starts fresh.
+    human_gate_guard = HumanGateGuard()
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -7234,6 +7238,7 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _tool_result_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -7243,6 +7248,34 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                human_gate_response = human_gate_guard.observe(
+                    messages[_tool_result_start:],
+                    blocked_work=(
+                        f"task {effective_task_id}"
+                        if effective_task_id
+                        else "this task"
+                    ),
+                )
+                if human_gate_response is not None:
+                    _turn_exit_reason = "human_gate_iteration_cap"
+                    final_response = human_gate_response
+                    agent._emit_status(
+                        "Human-only gate repeated for 10 iterations; stopping."
+                    )
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

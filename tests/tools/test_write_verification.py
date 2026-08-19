@@ -27,6 +27,19 @@ class TestWriteVerification:
         r = json.loads(write_file_tool(str(f), content, task_id="t-wv"))
         assert r.get("verified") is True
 
+    def test_identical_content_is_verified_noop_not_a_modification(self, workdir):
+        f = workdir / "same.txt"
+        f.write_text("same content\n", encoding="utf-8")
+
+        r = json.loads(
+            write_file_tool(str(f), "same content\n", task_id="t-wv-noop")
+        )
+
+        assert r.get("unchanged") is True
+        assert r.get("verified") is True
+        assert r.get("bytes_written") == 0
+        assert "files_modified" not in r
+
     def test_crlf_preservation_still_verifies(self, workdir):
         # Existing CRLF file: write_file converts LF content to CRLF before
         # writing; verification hashes the shim-adjusted content, so it must

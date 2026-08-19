@@ -237,12 +237,16 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    controlled_text_response = (
+        normal_text_response
+        or str(_turn_exit_reason) == "human_gate_iteration_cap"
+    )
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
-            or normal_text_response
+            or controlled_text_response
         )
     )
 

@@ -188,6 +188,9 @@ class WriteResult:
     # verify (no sha256sum). A mismatch never reaches the caller as a
     # flag — it becomes a hard error.
     verified: Optional[bool] = None
+    # True when the requested content already matched the on-disk bytes and no
+    # write occurred. Optional keeps legacy result JSON unchanged on real writes.
+    unchanged: Optional[bool] = None
     lint: Optional[Dict[str, Any]] = None
     # Semantic diagnostics from the LSP layer, when applicable.  Kept in
     # its own field (not folded into ``lint``) so the model and any
@@ -2117,6 +2120,26 @@ class ShellFileOperations(FileOperations):
                     "UTF-8. The file was NOT created or modified."
                 )
             )
+        expected_sha = hashlib.sha256(content_bytes).hexdigest()
+        try:
+            hash_cmd = f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null"
+            existing_hash = self._exec(hash_cmd)
+            if (
+                existing_hash.exit_code == 0
+                and existing_hash.stdout.strip()
+                and existing_hash.stdout.strip().split()[0] == expected_sha
+            ):
+                return WriteResult(
+                    bytes_written=0,
+                    dirs_created=False,
+                    verified=True,
+                    unchanged=True,
+                )
+        except Exception:
+            # Hash comparison is an optimization, never a reason to lose a
+            # requested write when the backend lacks sha256sum.
+            pass
+
         write_result = self._atomic_write(path, content)
 
         if write_result.exit_code != 0:
@@ -2143,7 +2166,6 @@ class ShellFileOperations(FileOperations):
             hash_result = self._exec(hash_cmd)
             if hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
-                expected_sha = hashlib.sha256(content_bytes).hexdigest()
                 content_verified = disk_sha == expected_sha
                 if not content_verified:
                     return WriteResult(

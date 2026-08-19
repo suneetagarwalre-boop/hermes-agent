@@ -3435,11 +3435,22 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Normalize once so every caller (CLI, dashboard, tool, webhook) shares the
+    # same job identity. Whitespace-only keys mean "no idempotency contract".
+    if idempotency_key is not None:
+        raw_idempotency_key = str(idempotency_key)
+        if raw_idempotency_key and (
+            len(raw_idempotency_key) > 256
+            or not raw_idempotency_key.isprintable()
+        ):
+            raise ValueError(
+                "idempotency_key must be at most 256 printable characters"
+            )
+        idempotency_key = raw_idempotency_key.strip() or None
+
+    # Idempotency fast path — return the existing task instead of creating a
+    # duplicate. The decisive check runs again inside write_txn below; without
+    # that lock-protected check, concurrent creators can all miss here.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -3480,6 +3491,19 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # BEGIN IMMEDIATE serializes the decisive idempotency check with
+                # insertion. Every racing creator that missed the fast path now
+                # observes the winner's committed row and continues that card.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
