@@ -1396,6 +1396,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    max_turns = args.get("max_turns")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1451,6 +1452,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                max_turns=max_turns,
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -2235,6 +2237,16 @@ KANBAN_CREATE_SCHEMA = {
                     "Per-task runtime cap. When exceeded, the "
                     "dispatcher SIGTERMs the worker and re-queues the "
                     "task with outcome='timed_out'."
+                ),
+            },
+            "max_turns": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 300,
+                "default": 60,
+                "description": (
+                    "Per-task agent iteration budget passed to the worker as "
+                    "--max-turns. Defaults to 60 and is capped at 300."
                 ),
             },
             "initial_status": {

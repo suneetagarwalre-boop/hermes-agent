@@ -134,6 +134,12 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Every Kanban card carries its own agent-loop budget. Sixty preserves the
+# historical worker default; 300 keeps the override useful for large tasks
+# without letting a card disable the runaway backstop entirely.
+DEFAULT_TASK_MAX_TURNS = 60
+MAX_TASK_MAX_TURNS = 300
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1085,6 +1091,7 @@ class Task:
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    max_turns: int = DEFAULT_TASK_MAX_TURNS
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
@@ -1190,6 +1197,11 @@ class Task:
             ),
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+            ),
+            max_turns=(
+                int(row["max_turns"])
+                if "max_turns" in keys and row["max_turns"] is not None
+                else DEFAULT_TASK_MAX_TURNS
             ),
             last_heartbeat_at=(
                 row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
@@ -1362,6 +1374,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
+    -- Per-task agent-loop budget. The dispatcher always passes this value
+    -- through as ``--max-turns``. The application bounds writes to 1..300.
+    max_turns            INTEGER NOT NULL DEFAULT 60,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -2594,6 +2609,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
         )
+    if "max_turns" not in cols:
+        # Existing cards keep the historical 60-turn worker budget.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "max_turns",
+            f"max_turns INTEGER NOT NULL DEFAULT {DEFAULT_TASK_MAX_TURNS}",
+        )
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
@@ -3171,6 +3194,7 @@ def create_task(
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
+    max_turns: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
@@ -3200,6 +3224,10 @@ def create_task(
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
     re-queues the task. ``None`` means no cap (default).
+
+    ``max_turns`` is the worker's agent-loop iteration budget. ``None``
+    preserves the historical 60-turn default; values above 300 are rejected
+    so the per-card knob cannot remove the runaway backstop.
 
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
@@ -3244,6 +3272,17 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    if max_turns is None:
+        task_max_turns = DEFAULT_TASK_MAX_TURNS
+    else:
+        if isinstance(max_turns, bool) or not isinstance(max_turns, int):
+            raise ValueError("max_turns must be an integer")
+        task_max_turns = max_turns
+    if not 1 <= task_max_turns <= MAX_TASK_MAX_TURNS:
+        raise ValueError(
+            f"max_turns must be between 1 and {MAX_TASK_MAX_TURNS}"
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3494,11 +3533,11 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
+                        max_runtime_seconds, max_turns,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3516,6 +3555,7 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                        task_max_turns,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         model_override,
@@ -3549,6 +3589,7 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "max_turns": task_max_turns,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -10958,6 +10999,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--max-turns", str(task.max_turns),
         "-q", prompt,
     ])
     if task.goal_mode:

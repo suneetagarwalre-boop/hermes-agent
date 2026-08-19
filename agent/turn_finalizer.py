@@ -74,15 +74,28 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
+            error = (
+                f"Iteration budget exhausted "
+                f"({api_call_count}/{max_iterations}) — "
+                "task could not complete within the allowed iterations"
+            )
+            try:
+                _task = _kb.get_task(_conn, kanban_task)
+                if _task is not None and _task.title.strip():
+                    error = (
+                        f"Iteration budget exhausted while working on "
+                        f"{_task.title.strip()!r}: used {api_call_count} of "
+                        f"{max_iterations} iterations. Raise max_turns or split "
+                        "the task into a smaller scope."
+                    )
+            except Exception:
+                # Keep failure recording functional for legacy/minimal DB
+                # adapters that cannot resolve the card title.
+                pass
             _kb._record_task_failure(
                 _conn,
                 kanban_task,
-                error=(
-                    f"Iteration budget exhausted "
-                    f"({api_call_count}/{max_iterations}) — "
-                    "task could not complete within the allowed "
-                    "iterations"
-                ),
+                error=error,
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
