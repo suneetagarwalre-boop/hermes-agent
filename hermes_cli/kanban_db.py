@@ -8849,6 +8849,58 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+# Box-drawing / rule characters Hermes uses to frame its TUI banners. They
+# carry no diagnostic signal, so they're stripped out of exit excerpts.
+_LOG_FRAME_CHARS = "\u2500\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2550\u2551\u2571\u2594"
+
+
+def worker_exit_excerpt(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    max_lines: int = 12,
+    max_chars: int = 700,
+) -> Optional[str]:
+    """Return a compact excerpt of the tail of a worker's log, or None.
+
+    A worker that exits rc=0 without a terminal kanban call leaves the
+    only evidence of *why* in its log file — a startup SyntaxError, an
+    unknown-model bail, a missing credential. The reap path used to
+    discard that entirely and report a generic protocol violation, which
+    made a hard runtime break look identical to a worker that merely
+    forgot its paperwork (that ambiguity hid a 3h fleet-wide outage on
+    2026-08-18). Surfacing the tail costs one bounded read and makes the
+    failure self-describing.
+
+    Defensive by construction: any failure to read returns None so the
+    caller still reports its generic message rather than raising inside
+    the reap loop.
+    """
+    try:
+        raw = read_worker_log(task_id, tail_bytes=8192, board=board)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip().strip(_LOG_FRAME_CHARS).strip()
+        if not stripped:
+            continue
+        # Collapse the runs of repeated identical banner lines a crash-loop
+        # produces, so the excerpt shows distinct evidence rather than the
+        # same line twelve times.
+        if lines and lines[-1] == stripped:
+            continue
+        lines.append(stripped)
+    if not lines:
+        return None
+    excerpt = " | ".join(lines[-max_lines:])
+    if len(excerpt) > max_chars:
+        excerpt = "..." + excerpt[-(max_chars - 3):]
+    return excerpt
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -8933,6 +8985,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "without a terminal kanban call counts as failed no "
                     "matter what it did."
                 )
+                # Attach the tail of the worker log. Without it this message
+                # is identical whether the worker did the work and skipped
+                # the paperwork or died on a startup error having done
+                # nothing — and those need opposite responses.
+                _excerpt = worker_exit_excerpt(row["id"])
+                if _excerpt:
+                    error_text += f" Worker log tail: {_excerpt}"
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
