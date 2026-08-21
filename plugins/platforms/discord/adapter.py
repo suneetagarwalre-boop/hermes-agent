@@ -140,6 +140,11 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+try:
+    from .mention_rewriter import rewrite_plain_mentions
+except ImportError:
+    from mention_rewriter import rewrite_plain_mentions
+
 from gateway.config import Platform, PlatformConfig
 
 from gateway.platforms.helpers import (
@@ -3659,6 +3664,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
+        content = rewrite_plain_mentions(content)
 
         if not thread_name:
             # Prefer the text content, fall back to the first attached
@@ -4002,7 +4008,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
         msg = await channel.send(
-            content=caption if caption else None,
+            content=rewrite_plain_mentions(caption) if caption else None,
             files=[discord_file],
         )
         attachments = getattr(msg, "attachments", None) or []
@@ -4126,7 +4132,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
 
                 # Use the first caption if any (Discord only has one message body for the group)
-                content = captions[0] if captions else None
+                content = rewrite_plain_mentions(captions[0]) if captions else None
                 logger.info(
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
                     self.name, len(files), chunk_idx + 1, len(chunks),
@@ -5448,7 +5454,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
 
                 msg = await channel.send(
-                    content=caption if caption else None,
+                    content=rewrite_plain_mentions(caption) if caption else None,
                     file=file,
                 )
                 return SendResult(success=True, message_id=str(msg.id))
@@ -5520,7 +5526,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
 
                 msg = await channel.send(
-                    content=caption if caption else None,
+                    content=rewrite_plain_mentions(caption) if caption else None,
                     file=file,
                 )
                 return SendResult(success=True, message_id=str(msg.id))
@@ -5770,7 +5776,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not content:
             return content
-        return convert_table_to_bullets(content)
+        return rewrite_plain_mentions(convert_table_to_bullets(content))
 
     async def _run_simple_slash(
         self,
@@ -7532,7 +7538,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 smart_denied=smart_denied,
             )
 
-            send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
+            send_kwargs: Dict[str, Any] = {
+                "content": rewrite_plain_mentions(content),
+                "embed": embed,
+                "view": view,
+            }
             if mention_content:
                 allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
                 if allowed_mentions_cls is not None:
@@ -7587,7 +7597,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_role_ids=self._allowed_role_ids,
             )
 
-            msg = await channel.send(content=content, embed=embed, view=view)
+            msg = await channel.send(
+                content=rewrite_plain_mentions(content), embed=embed, view=view
+            )
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
@@ -7712,6 +7724,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
+            content = rewrite_plain_mentions(content)
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
@@ -7754,7 +7767,9 @@ class DiscordAdapter(BasePlatformAdapter):
             content = self._self_contained_prompt_content(
                 "⚕ **Update Needs Your Input**", f"{prompt}{default_hint}"
             )
-            msg = await channel.send(content=content, embed=embed, view=view)
+            msg = await channel.send(
+                content=rewrite_plain_mentions(content), embed=embed, view=view
+            )
             view._message = msg  # store for on_timeout expiration editing
             if _metadata_marks_nonconversational(metadata):
                 self._nonconversational_messages.mark_many([str(msg.id)])
