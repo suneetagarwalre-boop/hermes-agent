@@ -9980,6 +9980,10 @@ async def _standalone_send(
     ``force_document`` is accepted for signature parity but unused — Discord
     treats every uploaded file as a generic attachment.
     """
+    message = rewrite_plain_mentions(message)
+    if caption:
+        caption = rewrite_plain_mentions(caption)
+
     try:
         import aiohttp
     except ImportError:

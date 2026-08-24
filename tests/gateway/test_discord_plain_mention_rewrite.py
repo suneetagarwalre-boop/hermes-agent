@@ -8,6 +8,10 @@ import pytest
 from gateway.config import PlatformConfig
 from plugins.platforms.discord import mention_rewriter
 from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord.adapter import (
+    _remember_channel_is_forum,
+    _standalone_send,
+)
 
 
 @pytest.fixture
@@ -83,3 +87,60 @@ def test_adapter_real_send_path_rewrites_before_channel_send(
     assert channel.send.await_args.kwargs["content"] == (
         "please ask <@1511441029314908171>"
     )
+
+
+def test_standalone_send_message_path_rewrites_before_rest_post(
+    monkeypatch, roster
+):
+    class Content:
+        def __init__(self):
+            self.parts = [b'{"id":"message-1"}', b""]
+
+        async def read(self, _size):
+            return self.parts.pop(0) if self.parts else b""
+
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self.content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def get_encoding(self):
+            return "utf-8"
+
+    posted = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, url, **kwargs):
+            posted.append((url, kwargs.get("json")))
+            return Response()
+
+    monkeypatch.setattr(mention_rewriter, "DEFAULT_ROSTER_PATH", roster)
+    mention_rewriter._ROSTER_CACHE.clear()
+    _remember_channel_is_forum("555", False)
+
+    import aiohttp
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: Session())
+    result = asyncio.run(
+        _standalone_send(
+            SimpleNamespace(token="test-token"),
+            "555",
+            "please ask @Letterman",
+        )
+    )
+
+    assert result["success"] is True
+    assert posted[0][1]["content"] == "please ask <@1511441029314908171>"
