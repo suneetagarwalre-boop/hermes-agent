@@ -501,6 +501,43 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     assert ":group:" not in wake_key
 
 
+def test_discord_wake_only_delivers_no_passive_duplicate(tmp_path, monkeypatch):
+    """A Discord completion wakes the agent without a second passive ping."""
+    db_path = tmp_path / "discord-wake-only.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="single discord receipt",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="channel-1",
+            chat_type="group",
+            delivery_mode="wake",
+        )
+        kb.complete_task(conn, tid, summary="verified result")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    setattr(runner, "adapters", {Platform.DISCORD: adapter})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.platform.value == "discord"
+    assert adapter.handled[0].source.chat_id == "channel-1"
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:

@@ -551,9 +551,16 @@ class GatewaySlashCommandsMixin:
                                     user_id=user_id,
                                     user_id_alt=user_id_alt,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                    # Subscribing from chat: deliver the passive
-                                    # message and wake the destination agent.
-                                    delivery_mode="notify+wake",
+                                    # Discord uses one visible completion
+                                    # owner. A passive notification plus an
+                                    # agent wake produces duplicate receipts;
+                                    # wake the agent only so it publishes the
+                                    # final response once.
+                                    delivery_mode=(
+                                        "wake"
+                                        if platform_str == "discord"
+                                        else "notify+wake"
+                                    ),
                                     delivery_metadata=delivery_metadata,
                                 )
                             finally:

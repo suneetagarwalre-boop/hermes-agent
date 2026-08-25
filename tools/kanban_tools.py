@@ -1558,7 +1558,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         is_gateway_session = platform != "tui"
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        delivery_mode = "notify+wake" if is_gateway_session else None
+        # Discord must have one visible completion owner. ``notify+wake``
+        # first posts a passive "Kanban done" message and then wakes the
+        # originating agent, which publishes a second completion receipt.
+        # Wake-only lets that agent inspect the result and send one distilled
+        # reply. Other push platforms retain the established passive+wake UX.
+        if platform.lower() == "discord":
+            delivery_mode = "wake"
+        else:
+            delivery_mode = "notify+wake" if is_gateway_session else None
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None

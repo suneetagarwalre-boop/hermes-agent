@@ -871,6 +871,33 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["delivery_mode"] == "notify+wake"
 
 
+def test_create_subscribes_discord_session_wake_only(monkeypatch, worker_env):
+    """Discord completion has one visible owner.
+
+    A passive notification plus an agent wake produces two user-visible
+    completion receipts. Discord therefore wakes the originating agent only;
+    that agent inspects the task and publishes the single final response.
+    """
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-42")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+
+    out = kt._handle_create({
+        "title": "discord single receipt",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "discord"
+    assert subs[0]["delivery_mode"] == "wake"
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
