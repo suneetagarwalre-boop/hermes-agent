@@ -5258,6 +5258,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES",
             )
 
+        # ── Operator gate (local patch, Suneet's Mac mini, 2026-08-25) ──
+        # DISCORD_ALLOWED_USERS was widened to "*" so any human in the guild can
+        # ADDRESS an agent by @mention in a wired channel. Slash commands are a
+        # different thing entirely: /restart, /sethome, /model, /background and
+        # friends reconfigure and control the agent, and _evaluate_slash_
+        # authorization mirrors the message gate one-for-one — so widening the
+        # message gate would have handed agent control to every guild member.
+        # Addressability was widened; authority was not. Slash stays keyed on
+        # an immutable operator user ID.
+        operator_ids = {
+            entry.strip()
+            for entry in os.getenv(
+                "HERMES_SLASH_OPERATOR_IDS", "1055171971282899095",
+            ).split(",")
+            if entry.strip()
+        }
+        if operator_ids and "*" not in operator_ids and user_id not in operator_ids:
+            return (False, "user not in HERMES_SLASH_OPERATOR_IDS")
+
         return (True, None)
 
     async def _check_slash_authorization(

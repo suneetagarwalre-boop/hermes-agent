@@ -584,9 +584,22 @@ def build_session_context_prompt(
             "with [sender name]. Multiple users may participate."
         )
     elif context.source.user_name:
-        lines.append(
-            f"**User:** {_format_untrusted_prompt_value(context.source.user_name)}"
-        )
+        # Carry the immutable platform user ID alongside the display name.
+        # Authority rules in the SOUL prompts are keyed on a user ID; a display
+        # name is renameable and is attribution only, never proof of identity.
+        # Without the ID the agent had no way to actually check the rule it was
+        # given (Suneet's Mac mini, 2026-08-25 — local patch).
+        _uname = _format_untrusted_prompt_value(context.source.user_name)
+        _uid = context.source.user_id
+        if _uid and redact_pii:
+            _uid = _hash_sender_id(_uid)
+        if _uid:
+            lines.append(
+                f"**User:** {_uname} "
+                f"(platform user ID {_format_untrusted_prompt_value(_uid)})"
+            )
+        else:
+            lines.append(f"**User:** {_uname}")
     elif context.source.user_id:
         uid = context.source.user_id
         if redact_pii:
