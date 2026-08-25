@@ -17987,15 +17987,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # On Slack, expose the current author's verifiable user ID next to
-            # the display name (#17916): "mention me again" requests need a
-            # trusted `<@U...>` target for the CURRENT speaker — display names
-            # are ambiguous and historical mentions may point at someone else.
-            # The user_id comes from the Slack event envelope (not
-            # user-editable text), so it does not need neutralization.
-            if source.platform == Platform.SLACK and source.user_id:
+            # On Slack and Discord, expose the current author's verifiable user
+            # ID next to the display name: inter-agent replies need a trusted
+            # mention target for the CURRENT speaker. Display names are ambiguous
+            # and historical mentions may point at someone else. The user_id comes
+            # from the platform event envelope (not user-editable text), so it does
+            # not need neutralization.
+            if source.platform in {Platform.SLACK, Platform.DISCORD} and source.user_id:
+                platform_label = "Slack" if source.platform == Platform.SLACK else "Discord"
                 _safe_user_name = (
-                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
+                    f"{_safe_user_name} | {platform_label} user <@{source.user_id}>"
                 )
             message_text = f"[{_safe_user_name}] {message_text}"
 
