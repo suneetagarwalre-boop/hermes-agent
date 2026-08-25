@@ -3036,7 +3036,9 @@ class TestProbeGatewayHealth:
 
         assert alive is False
         assert body is None
-        assert timeouts == [0.75, 0.75]
+        assert len(timeouts) == 2
+        assert 0 < timeouts[0] <= 0.375
+        assert 0 < timeouts[1] <= 0.75
 
 
 
@@ -3055,7 +3057,9 @@ class TestProbeGatewayHealth:
                 raise ConnectionError("detailed failed")
             mock_resp = MagicMock()
             mock_resp.status = 200
-            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.read.return_value = json.dumps(
+                {"status": "ok", "platform": "hermes-agent"}
+            ).encode()
             mock_resp.__enter__ = MagicMock(return_value=mock_resp)
             mock_resp.__exit__ = MagicMock(return_value=False)
             return mock_resp
@@ -3065,6 +3069,71 @@ class TestProbeGatewayHealth:
         assert alive is True
         assert body["status"] == "ok"
         assert call_count[0] == 2
+
+    def test_outer_timeout_does_not_wait_for_probe_worker_shutdown(self, monkeypatch):
+        """The route's timeout must bound elapsed time even if the worker is stuck."""
+        import hermes_cli.web_server as ws
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_probe():
+            started.set()
+            release.wait(timeout=1.0)
+            finished.set()
+            return True, {"status": "ok", "platform": "hermes-agent"}
+
+        monkeypatch.setattr(ws, "_probe_gateway_health", blocked_probe)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_ROUTE_TIMEOUT", 0.05)
+
+        before = time.monotonic()
+        try:
+            assert ws._bounded_gateway_health_probe() == (False, None)
+            elapsed = time.monotonic() - before
+            assert started.is_set()
+            assert not finished.is_set()
+        finally:
+            release.set()
+
+        assert finished.wait(timeout=1.0)
+        assert elapsed < 0.5
+
+    def test_repeated_blocked_probes_have_fixed_daemon_capacity(self, monkeypatch):
+        """Status polling cannot accumulate workers behind a stuck network call."""
+        import hermes_cli.web_server as ws
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        worker_threads = []
+
+        def blocked_probe():
+            worker_threads.append(threading.current_thread())
+            started.set()
+            release.wait(timeout=2.0)
+            finished.set()
+            return False, None
+
+        monkeypatch.setattr(ws, "_probe_gateway_health", blocked_probe)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_ROUTE_TIMEOUT", 0.01)
+
+        try:
+            assert ws._bounded_gateway_health_probe() == (False, None)
+            assert started.is_set()
+
+            before = time.monotonic()
+            for _ in range(20):
+                assert ws._bounded_gateway_health_probe() == (False, None)
+            elapsed = time.monotonic() - before
+
+            assert len(worker_threads) == 1
+            assert worker_threads[0].daemon is True
+            assert elapsed < 0.5
+        finally:
+            release.set()
+
+        assert finished.wait(timeout=1.0)
 
 
 class TestStatusRemoteGateway:

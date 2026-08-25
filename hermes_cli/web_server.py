@@ -98,6 +98,7 @@ from gateway.status import (
     get_runtime_status_running_pid,
     normalize_updated_at,
     parse_active_agents,
+    probe_gateway_health,
     read_runtime_status,
     resolve_gateway_liveness,
 )
@@ -1779,6 +1780,10 @@ def _apply_main_model_assignment(
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
 _GATEWAY_HEALTH_TIMEOUT_MAX = 1.0
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
+_GATEWAY_HEALTH_PROBE_CAPACITY = 1
+_gateway_health_probe_slots = threading.BoundedSemaphore(
+    value=_GATEWAY_HEALTH_PROBE_CAPACITY
+)
 try:
     _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "1"))
 except (ValueError, TypeError):
@@ -1830,27 +1835,62 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
 
     This is a **blocking** call — run via ``run_in_executor`` from async code.
     """
-    if not _GATEWAY_HEALTH_URL:
+    return probe_gateway_health(
+        _GATEWAY_HEALTH_URL,
+        timeout=_GATEWAY_HEALTH_TIMEOUT,
+        urlopen=urllib.request.urlopen,
+    )
+
+
+def _bounded_gateway_health_probe() -> tuple[bool, dict | None]:
+    """Run the blocking health probe without exceeding the route's time budget."""
+    # A ThreadPoolExecutor cannot provide both properties needed here: timed-out
+    # running futures cannot be cancelled, and its non-daemon workers are joined
+    # by CPython at interpreter exit. A shared semaphore plus one daemon worker
+    # per accepted probe is the equivalent capacity-bounded design: at most one
+    # blocked network call exists, repeated status polls fail fast while it is in
+    # flight, and a wedged probe cannot hold process shutdown hostage.
+    if not _gateway_health_probe_slots.acquire(blocking=False):
+        _log.warning(
+            "/api/status gateway health probe capacity exhausted; using local status"
+        )
         return False, None
 
-    # Normalise to base URL so we always probe the right paths regardless of
-    # whether the user included /health or /health/detailed in the env var.
-    base = _GATEWAY_HEALTH_URL.rstrip("/")
-    if base.endswith("/health/detailed"):
-        base = base[: -len("/health/detailed")]
-    elif base.endswith("/health"):
-        base = base[: -len("/health")]
+    future: concurrent.futures.Future[tuple[bool, dict | None]] = (
+        concurrent.futures.Future()
+    )
 
-    for path in (f"{base}/health/detailed", f"{base}/health"):
+    def _worker() -> None:
         try:
-            req = urllib.request.Request(path, method="GET")
-            with urllib.request.urlopen(req, timeout=_GATEWAY_HEALTH_TIMEOUT) as resp:
-                if resp.status == 200:
-                    body = json.loads(resp.read())
-                    return True, body
-        except Exception:
-            continue
-    return False, None
+            result = _probe_gateway_health()
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+        finally:
+            _gateway_health_probe_slots.release()
+
+    try:
+        worker = threading.Thread(
+            target=_worker,
+            name="gateway-health-probe",
+            daemon=True,
+        )
+        worker.start()
+    except Exception:
+        _gateway_health_probe_slots.release()
+        return False, None
+
+    try:
+        return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        _log.warning(
+            "/api/status gateway health probe exceeded %.2fs; using local status",
+            _GATEWAY_HEALTH_ROUTE_TIMEOUT,
+        )
+        return False, None
+    except Exception:
+        return False, None
 
 
 def _count_status_active_sessions() -> int:
@@ -3577,27 +3617,6 @@ async def get_status(profile: Optional[str] = None):
         # The module-level probe references are handed to the resolver so the
         # long-standing `monkeypatch.setattr(web_server, "get_running_pid_cached", ...)`
         # seam used across the test-suite still intercepts them.
-        def _bounded_health_probe():
-            """Health probe with the route's blocking-call budget preserved.
-
-            The resolver only reaches this rung when the local PID probe came
-            up empty, so the timeout is paid at most once per request and only
-            in the cross-container case that needs it.
-            """
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_probe_gateway_health)
-                try:
-                    return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
-                except concurrent.futures.TimeoutError:
-                    _log.warning(
-                        "/api/status gateway health probe exceeded %.2fs; "
-                        "using local status",
-                        _GATEWAY_HEALTH_ROUTE_TIMEOUT,
-                    )
-                    return False, None
-                except Exception:
-                    return False, None
-
         local_runtime = (
             read_runtime_status(path=profile_dir / "gateway_state.json")
             if profile_dir
@@ -3608,7 +3627,9 @@ async def get_status(profile: Optional[str] = None):
             lambda: resolve_gateway_liveness(
                 profile_dir=profile_dir,
                 runtime=local_runtime,
-                health_probe=_bounded_health_probe if _GATEWAY_HEALTH_URL else None,
+                health_probe=_bounded_gateway_health_probe
+                if _GATEWAY_HEALTH_URL
+                else None,
                 pid_probe=get_running_pid_cached,
                 runtime_reader=read_runtime_status,
                 runtime_pid_probe=get_runtime_status_running_pid,

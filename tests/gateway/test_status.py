@@ -1273,6 +1273,138 @@ class TestNormalizeUpdatedAt:
         assert status.normalize_updated_at(-1750000000) is None
 
 
+class TestProbeGatewayHealth:
+    """Cross-container HTTP health probe contract."""
+
+    class _Response:
+        def __init__(self, status_code=200, body=None):
+            self.status = status_code
+            self._body = body if body is not None else {}
+            self.read_sizes = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=-1):
+            self.read_sizes.append(size)
+            raw = json.dumps(self._body).encode("utf-8")
+            return raw if size < 0 else raw[:size]
+
+    def test_probe_accepts_degraded_detailed_gateway_body(self):
+        calls = []
+
+        def urlopen(req, **kwargs):
+            calls.append((req.full_url, kwargs.get("timeout")))
+            return self._Response(
+                body={
+                    "status": "degraded",
+                    "platform": "hermes-agent",
+                    "gateway_state": "running",
+                    "pid": 4242,
+                }
+            )
+
+        alive, body = status.probe_gateway_health(
+            "http://gw:8642/health", timeout=0.25, urlopen=urlopen
+        )
+
+        assert alive is True
+        assert body is not None
+        assert body["pid"] == 4242
+        assert len(calls) == 1
+        assert calls[0][0] == "http://gw:8642/health/detailed"
+        assert 0 < calls[0][1] <= 0.125
+
+    def test_probe_falls_back_to_simple_health_when_detailed_fails(self):
+        calls = []
+
+        def urlopen(req, **kwargs):
+            calls.append(req.full_url)
+            if req.full_url.endswith("/health/detailed"):
+                raise ConnectionError("auth or route unavailable")
+            return self._Response(body={"status": "ok", "platform": "hermes-agent"})
+
+        alive, body = status.probe_gateway_health("http://gw:8642", urlopen=urlopen)
+
+        assert alive is True
+        assert body == {"status": "ok", "platform": "hermes-agent"}
+        assert calls == ["http://gw:8642/health/detailed", "http://gw:8642/health"]
+
+    def test_detailed_timeout_leaves_budget_for_simple_health(self, monkeypatch):
+        """Both endpoints must share one deadline without starving fallback."""
+        now = [100.0]
+        outer_deadline = now[0] + 1.0
+        calls = []
+
+        monkeypatch.setattr(status.time, "monotonic", lambda: now[0])
+
+        def urlopen(req, **kwargs):
+            attempt_timeout = kwargs["timeout"]
+            calls.append((req.full_url, attempt_timeout))
+            if req.full_url.endswith("/health/detailed"):
+                now[0] += attempt_timeout
+                raise TimeoutError("detailed endpoint exhausted its budget")
+            if now[0] >= outer_deadline:
+                raise TimeoutError("shared probe deadline exhausted")
+            return self._Response(body={"status": "ok", "platform": "hermes-agent"})
+
+        alive, body = status.probe_gateway_health(
+            "http://gw:8642", timeout=1.0, urlopen=urlopen
+        )
+
+        assert alive is True
+        assert body == {"status": "ok", "platform": "hermes-agent"}
+        assert [url for url, _ in calls] == [
+            "http://gw:8642/health/detailed",
+            "http://gw:8642/health",
+        ]
+        assert calls[0][1] == pytest.approx(0.5)
+        assert calls[1][1] == pytest.approx(0.5)
+
+    def test_probe_rejects_non_hermes_200_json(self):
+        calls = []
+
+        def urlopen(req, **kwargs):
+            calls.append(req.full_url)
+            return self._Response(body={"status": "ok", "service": "reverse-proxy"})
+
+        alive, body = status.probe_gateway_health("http://gw:8642", urlopen=urlopen)
+
+        assert alive is False
+        assert body is None
+        assert calls == ["http://gw:8642/health/detailed", "http://gw:8642/health"]
+
+    def test_probe_caps_response_before_json_parsing(self, monkeypatch):
+        monkeypatch.setattr(status, "_GATEWAY_HEALTH_MAX_RESPONSE_BYTES", 32)
+        response = self._Response(
+            body={
+                "status": "ok",
+                "platform": "hermes-agent",
+                "padding": "x" * 128,
+            }
+        )
+        calls = []
+
+        def urlopen(req, **kwargs):
+            calls.append(req.full_url)
+            return response
+
+        def unexpected_json_parse(_payload):
+            pytest.fail("oversized health response must not be parsed as JSON")
+
+        monkeypatch.setattr(status.json, "loads", unexpected_json_parse)
+
+        alive, body = status.probe_gateway_health("http://gw:8642", urlopen=urlopen)
+
+        assert alive is False
+        assert body is None
+        assert response.read_sizes == [33, 33]
+        assert calls == ["http://gw:8642/health/detailed", "http://gw:8642/health"]
+
+
 class TestRuntimeStatusUpdatedAtContract:
     def test_write_then_read_updated_at_parses_tz_aware(self, tmp_path, monkeypatch):
         """write_runtime_status persists an updated_at that fromisoformat

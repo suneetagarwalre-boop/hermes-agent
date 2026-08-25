@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -300,6 +301,80 @@ def normalize_updated_at(value: Any) -> Optional[str]:
         except (OverflowError, OSError, ValueError):
             return None
     return None
+
+
+_GATEWAY_HEALTH_VALID_STATUSES = frozenset({"ok", "degraded"})
+_GATEWAY_HEALTH_PLATFORM = "hermes-agent"
+_GATEWAY_HEALTH_MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+def gateway_health_body_is_valid(body: Any) -> bool:
+    """Return True only for a Hermes gateway HTTP health response.
+
+    The cross-container liveness probe can be pointed at arbitrary infrastructure
+    via ``GATEWAY_HEALTH_URL``. A plain HTTP 200 is not enough evidence that a
+    Hermes gateway is alive: reverse proxies, captive portals, and unrelated
+    services commonly return 200 JSON too. Both gateway health endpoints stamp
+    ``platform: hermes-agent``; detailed readiness may report either ``ok`` or
+    ``degraded`` while the gateway process is still alive, so accept both.
+    """
+    if not isinstance(body, dict):
+        return False
+    if body.get("platform") != _GATEWAY_HEALTH_PLATFORM:
+        return False
+    return str(body.get("status") or "").lower() in _GATEWAY_HEALTH_VALID_STATUSES
+
+
+def _gateway_health_probe_urls(health_url: str) -> list[str]:
+    """Return detailed-then-simple health URLs from a base or explicit path."""
+    base = health_url.rstrip("/")
+    if base.endswith("/health/detailed"):
+        base = base[: -len("/health/detailed")]
+    elif base.endswith("/health"):
+        base = base[: -len("/health")]
+    return [f"{base}/health/detailed", f"{base}/health"]
+
+
+def probe_gateway_health(
+    health_url: Optional[str],
+    *,
+    timeout: float = 1.0,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Probe a Hermes gateway over HTTP and return ``(alive, body)``.
+
+    Accepts a base URL, ``/health``, or ``/health/detailed`` URL. The detailed
+    endpoint is tried first for richer state, then the simple endpoint is used as
+    a compatibility fallback. A probe only succeeds when the response body is a
+    valid Hermes gateway health document, not merely any 200 JSON payload.
+    """
+    if not health_url:
+        return False, None
+
+    urls = _gateway_health_probe_urls(health_url)
+    deadline = time.monotonic() + timeout
+    for index, url in enumerate(urls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Reserve an equal share of the remaining deadline for every endpoint
+        # still to try. If detailed consumes its full share, the simple health
+        # fallback still has enforceable time left inside the same total budget.
+        attempt_timeout = remaining / (len(urls) - index)
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urlopen(req, timeout=attempt_timeout) as resp:
+                if getattr(resp, "status", None) != 200:
+                    continue
+                raw_body = resp.read(_GATEWAY_HEALTH_MAX_RESPONSE_BYTES + 1)
+                if len(raw_body) > _GATEWAY_HEALTH_MAX_RESPONSE_BYTES:
+                    continue
+                body = json.loads(raw_body)
+        except Exception:
+            continue
+        if gateway_health_body_is_valid(body):
+            return True, body
+    return False, None
 
 
 def terminate_pid(pid: int, *, force: bool = False) -> None:
