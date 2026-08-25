@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -435,6 +435,10 @@ _GATE_ENV_KEYS = (
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_ALLOW_BOTS_CHANNELS",
+    "DISCORD_ALLOW_BOTS_IDS",
+    "DISCORD_BOT_LOOP_MAX_HOPS",
+    "DISCORD_BOT_LOOP_WINDOW_SECONDS",
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
 )
@@ -1081,6 +1085,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
         self._gate_env_snapshot: Optional[Dict[str, str]] = None
+        # Sliding-window bot-hop counters, keyed by Discord channel. Outbound
+        # inter-agent sends reserve a hop synchronously before the network write;
+        # peer ingress records the same hop on the receiving adapter, while the
+        # sender's later self MESSAGE_CREATE event is ignored to avoid double count.
+        self._bot_loop_hops: Dict[str, deque[float]] = {}
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -1565,13 +1574,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
         elif self._dedup.contains(message_id):
             return False, False
-        if message.author == self._client.user:
-            return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
 
         role_authorized = False
-        if getattr(message.author, "bot", False):
+        is_bot_author = bool(getattr(message.author, "bot", False))
+        is_self_message = message.author == getattr(self._client, "user", None)
+        if is_bot_author and is_self_message:
+            # Outbound inter-agent hops are reserved synchronously in send()
+            # before Discord can expose them to a peer. Never count the later
+            # self MESSAGE_CREATE event again.
+            return False, False
+        if is_bot_author:
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
@@ -1581,6 +1595,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
+                return False, False
+            if not self._bot_loop_guard_ok(message):
                 return False, False
         else:
             msg_guild = getattr(message, "guild", None)
@@ -3494,6 +3510,23 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel = await self._client.fetch_channel(int(chat_id))
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+            # Reserve inter-agent hops before the network write. Waiting for
+            # Discord to echo our own MESSAGE_CREATE creates a race where the
+            # peer can answer first and outrun the configured hard cap.
+            if not self._bot_loop_outbound_guard_ok(channel, content):
+                result = SendResult(
+                    success=False,
+                    error="Discord bot loop guard refused inter-agent send",
+                )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -6719,6 +6752,167 @@ class DiscordAdapter(BasePlatformAdapter):
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
         return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
+
+    def _bot_loop_guard_ok(
+        self,
+        message: Any,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Authorize and rate-bound one inbound Discord bot message."""
+        author_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+        return self._bot_loop_guard_values_ok(
+            channel=getattr(message, "channel", None),
+            author_id=author_id,
+            message_id=getattr(message, "id", None),
+            direction="inbound",
+            now=now,
+            enforce_author_allowlist=True,
+        )
+
+    def _bot_loop_outbound_guard_ok(
+        self,
+        channel: Any,
+        content: str,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Reserve an inter-agent hop before Discord can expose the send.
+
+        Only messages that explicitly mention an ID from
+        ``DISCORD_ALLOW_BOTS_IDS`` are inter-agent sends. Reserving before the
+        network write removes the race where a peer can answer before Discord
+        delivers our own MESSAGE_CREATE event back to this adapter.
+        """
+        allowed_bot_ids = self._gate_csv_set(self._gate_env("DISCORD_ALLOW_BOTS_IDS"))
+        if not allowed_bot_ids:
+            return True
+        mentioned_ids = {
+            match.group(1) for match in re.finditer(r"<@!?(\d+)>", content or "")
+        }
+        if not mentioned_ids:
+            return True
+        if "*" not in allowed_bot_ids and not (mentioned_ids & allowed_bot_ids):
+            return True
+        self_user = getattr(getattr(self, "_client", None), "user", None)
+        return self._bot_loop_guard_values_ok(
+            channel=channel,
+            author_id=str(getattr(self_user, "id", "") or ""),
+            message_id=None,
+            direction="outbound",
+            now=now,
+            enforce_author_allowlist=False,
+        )
+
+    def _bot_loop_guard_values_ok(
+        self,
+        *,
+        channel: Any,
+        author_id: str,
+        message_id: Any,
+        direction: str,
+        now: Optional[float],
+        enforce_author_allowlist: bool,
+    ) -> bool:
+        """Apply the four per-profile bot gates to one inbound/outbound hop.
+
+        ``DISCORD_ALLOW_BOTS`` controls the legacy none/mentions/all mode. These
+        four narrower gates add the code-enforced inter-agent boundary:
+
+        * ``DISCORD_ALLOW_BOTS_CHANNELS`` limits inter-agent channels.
+        * ``DISCORD_ALLOW_BOTS_IDS`` limits peer bot identities/targets.
+        * ``DISCORD_BOT_LOOP_MAX_HOPS`` is the hard hop cap.
+        * ``DISCORD_BOT_LOOP_WINDOW_SECONDS`` is its sliding time window.
+
+        Empty channel/ID lists preserve the legacy unrestricted scope. An empty
+        or non-positive hop/window value disables only the counter. Invalid
+        non-empty numeric configuration fails closed.
+        """
+        allowed_channels = self._gate_csv_set(
+            self._gate_env("DISCORD_ALLOW_BOTS_CHANNELS")
+        )
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_id = self._get_parent_channel_id(channel) if channel is not None else None
+        channel_keys = self._discord_channel_keys_from_channel(channel, parent_id)
+        if allowed_channels and "*" not in allowed_channels and not (
+            channel_keys & allowed_channels
+        ):
+            logger.warning(
+                "[%s] Discord bot loop guard blocked direction=%s message_id=%s "
+                "channel=%s author=%s reason=channel_not_allowed",
+                self.name,
+                direction,
+                message_id,
+                channel_id,
+                author_id,
+            )
+            return False
+
+        allowed_bot_ids = self._gate_csv_set(self._gate_env("DISCORD_ALLOW_BOTS_IDS"))
+        if (
+            enforce_author_allowlist
+            and allowed_bot_ids
+            and "*" not in allowed_bot_ids
+            and author_id not in allowed_bot_ids
+        ):
+            logger.warning(
+                "[%s] Discord bot loop guard blocked direction=%s message_id=%s "
+                "channel=%s author=%s reason=bot_not_allowed",
+                self.name,
+                direction,
+                message_id,
+                channel_id,
+                author_id,
+            )
+            return False
+
+        raw_max_hops = self._gate_env("DISCORD_BOT_LOOP_MAX_HOPS").strip()
+        raw_window = self._gate_env("DISCORD_BOT_LOOP_WINDOW_SECONDS").strip()
+        if not raw_max_hops or not raw_window:
+            return True
+        try:
+            max_hops = int(raw_max_hops)
+            window_seconds = float(raw_window)
+        except (TypeError, ValueError):
+            logger.error(
+                "[%s] Discord bot loop guard blocked direction=%s: invalid "
+                "DISCORD_BOT_LOOP_MAX_HOPS=%r or DISCORD_BOT_LOOP_WINDOW_SECONDS=%r",
+                self.name,
+                direction,
+                raw_max_hops,
+                raw_window,
+            )
+            return False
+        if max_hops <= 0 or window_seconds <= 0:
+            return True
+
+        current = time.monotonic() if now is None else float(now)
+        counters = getattr(self, "_bot_loop_hops", None)
+        if counters is None:
+            counters = {}
+            self._bot_loop_hops = counters
+        hops = counters.setdefault(channel_id, deque())
+        cutoff = current - window_seconds
+        while hops and hops[0] <= cutoff:
+            hops.popleft()
+        candidate_hop = len(hops) + 1
+        if candidate_hop >= max_hops:
+            logger.warning(
+                "[%s] Discord bot loop guard blocked direction=%s message_id=%s "
+                "channel=%s author=%s reason=hop_cap hop=%d max_hops=%d "
+                "window_seconds=%s",
+                self.name,
+                direction,
+                message_id,
+                channel_id,
+                author_id,
+                candidate_hop,
+                max_hops,
+                window_seconds,
+            )
+            return False
+        hops.append(current)
+        return True
 
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs/names where no bot mention is required.

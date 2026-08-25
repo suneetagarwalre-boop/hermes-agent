@@ -18,6 +18,7 @@ and assert each enforces only its own lists, order-independently.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,10 @@ GATE_VARS = [
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_ALLOW_BOTS_CHANNELS",
+    "DISCORD_ALLOW_BOTS_IDS",
+    "DISCORD_BOT_LOOP_MAX_HOPS",
+    "DISCORD_BOT_LOOP_WINDOW_SECONDS",
 ]
 
 
@@ -64,6 +69,207 @@ def _adapter(extra: dict | None = None) -> DiscordAdapter:
 def _snapshot(adapter: DiscordAdapter, values: dict) -> None:
     """Simulate the connect()-time per-profile snapshot."""
     adapter._gate_env_snapshot = {key: values.get(key, "") for key in _GATE_ENV_KEYS}
+
+
+def _bot_message(*, channel_id: str = "111", author_id: str = "9001"):
+    channel = SimpleNamespace(id=int(channel_id), name="team-chat", parent_id=None)
+    return SimpleNamespace(
+        id=1,
+        author=SimpleNamespace(id=int(author_id), bot=True),
+        channel=channel,
+    )
+
+
+class TestDiscordBotLoopGuard:
+    """The adapter, not either model, must bound bot-to-bot exchanges."""
+
+    @staticmethod
+    def _guarded_adapter(**overrides) -> DiscordAdapter:
+        adapter = _adapter()
+        values = {
+            "DISCORD_ALLOW_BOTS_CHANNELS": "111",
+            "DISCORD_ALLOW_BOTS_IDS": "9001,9002",
+            "DISCORD_BOT_LOOP_MAX_HOPS": "4",
+            "DISCORD_BOT_LOOP_WINDOW_SECONDS": "60",
+        }
+        values.update(overrides)
+        _snapshot(adapter, values)
+        return adapter
+
+    def test_counter_blocks_after_configured_hop_cap(self):
+        adapter = self._guarded_adapter()
+        message = _bot_message()
+
+        assert [adapter._bot_loop_guard_ok(message, now=float(i)) for i in range(3)] == [
+            True,
+            True,
+            True,
+        ]
+        assert adapter._bot_loop_guard_ok(message, now=3.0) is False
+
+    def test_window_expiry_releases_old_hops(self):
+        adapter = self._guarded_adapter()
+        message = _bot_message()
+
+        for instant in (0.0, 1.0, 2.0):
+            assert adapter._bot_loop_guard_ok(message, now=instant) is True
+        assert adapter._bot_loop_guard_ok(message, now=59.9) is False
+        assert adapter._bot_loop_guard_ok(message, now=60.0) is True
+
+    def test_counter_is_scoped_per_channel(self):
+        adapter = self._guarded_adapter(DISCORD_ALLOW_BOTS_CHANNELS="111,222")
+        for instant in range(3):
+            assert adapter._bot_loop_guard_ok(
+                _bot_message(channel_id="111"), now=float(instant)
+            ) is True
+
+        assert adapter._bot_loop_guard_ok(
+            _bot_message(channel_id="111"), now=3.0
+        ) is False
+        assert adapter._bot_loop_guard_ok(
+            _bot_message(channel_id="222"), now=3.0
+        ) is True
+
+    def test_unlisted_channel_is_rejected(self):
+        adapter = self._guarded_adapter()
+        assert adapter._bot_loop_guard_ok(
+            _bot_message(channel_id="222"), now=0.0
+        ) is False
+
+    def test_unlisted_bot_id_is_rejected(self):
+        adapter = self._guarded_adapter()
+        assert adapter._bot_loop_guard_ok(
+            _bot_message(author_id="9999"), now=0.0
+        ) is False
+
+    def test_peer_only_allowlists_still_count_both_sides_of_two_bot_chain(self):
+        adapter_a = self._guarded_adapter(DISCORD_ALLOW_BOTS_IDS="9002")
+        adapter_b = self._guarded_adapter(DISCORD_ALLOW_BOTS_IDS="9001")
+        from_a = _bot_message(author_id="9001")
+        from_b = _bot_message(author_id="9002")
+
+        # Sender reservations happen before Discord can expose the message to
+        # the peer. No self MESSAGE_CREATE event is needed for synchronization.
+        for hop, (sender, receiver, message) in enumerate(
+            (
+                (adapter_a, adapter_b, from_a),
+                (adapter_b, adapter_a, from_b),
+                (adapter_a, adapter_b, from_a),
+            ),
+            start=1,
+        ):
+            target_id = "9002" if sender is adapter_a else "9001"
+            assert sender._bot_loop_outbound_guard_ok(
+                message.channel,
+                f"<@{target_id}> continue",
+                now=float(hop),
+            ) is True
+            assert receiver._bot_loop_guard_ok(message, now=float(hop)) is True
+
+        assert adapter_b._bot_loop_outbound_guard_ok(
+            from_b.channel,
+            "<@9001> hop four",
+            now=4.0,
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_send_refuses_cap_hop_before_discord_network_write(
+        self, monkeypatch, caplog
+    ):
+        from unittest.mock import AsyncMock
+        from plugins.platforms.discord import adapter as discord_adapter_module
+
+        adapter = self._guarded_adapter(DISCORD_ALLOW_BOTS_IDS="9002")
+        channel = SimpleNamespace(
+            id=111,
+            name="team-chat",
+            parent_id=None,
+            send=AsyncMock(),
+        )
+        adapter._client = SimpleNamespace(
+            user=SimpleNamespace(id=9001, bot=True),
+            get_channel=lambda _channel_id: channel,
+        )
+        setattr(adapter, "_record_discord_response", lambda **_kwargs: None)
+
+        for hop in (1.0, 2.0, 3.0):
+            assert adapter._bot_loop_outbound_guard_ok(
+                channel,
+                "<@9002> continue",
+                now=hop,
+            ) is True
+        monkeypatch.setattr(discord_adapter_module.time, "monotonic", lambda: 4.0)
+
+        result = await adapter.send("111", "<@9002> hop four")
+
+        assert result.success is False
+        assert result.error == "Discord bot loop guard refused inter-agent send"
+        channel.send.assert_not_awaited()
+        assert "direction=outbound" in caplog.text
+        assert "reason=hop_cap hop=4 max_hops=4" in caplog.text
+
+    def test_missing_counter_config_preserves_legacy_allow_bots_behavior(self):
+        adapter = self._guarded_adapter(
+            DISCORD_BOT_LOOP_MAX_HOPS="",
+            DISCORD_BOT_LOOP_WINDOW_SECONDS="",
+        )
+        message = _bot_message()
+
+        assert all(
+            adapter._bot_loop_guard_ok(message, now=float(i))
+            for i in range(20)
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        (
+            {"DISCORD_BOT_LOOP_MAX_HOPS": ""},
+            {"DISCORD_BOT_LOOP_WINDOW_SECONDS": ""},
+            {"DISCORD_BOT_LOOP_MAX_HOPS": "0"},
+            {"DISCORD_BOT_LOOP_WINDOW_SECONDS": "0"},
+        ),
+    )
+    def test_partial_or_nonpositive_counter_config_disables_counter(self, overrides):
+        adapter = self._guarded_adapter(**overrides)
+        message = _bot_message()
+
+        assert all(
+            adapter._bot_loop_guard_ok(message, now=float(i))
+            for i in range(20)
+        )
+
+    def test_message_admission_refuses_the_cap_hop_before_model_dispatch(
+        self, monkeypatch, caplog
+    ):
+        import discord
+        from plugins.platforms.discord import adapter as discord_adapter_module
+
+        adapter = self._guarded_adapter(DISCORD_ALLOW_BOTS="mentions")
+        self_user = SimpleNamespace(id=9002, bot=True)
+        adapter._client = SimpleNamespace(user=self_user)
+        setattr(
+            adapter,
+            "_dedup",
+            SimpleNamespace(
+                is_duplicate=lambda _message_id: False,
+                contains=lambda _message_id: False,
+            ),
+        )
+        message = _bot_message(author_id="9001")
+        message.type = discord.MessageType.default
+        message.content = "<@9002> continue the pressure-test chain"
+        message.mentions = [self_user]
+
+        clock = iter((0.0, 1.0, 2.0, 3.0))
+        monkeypatch.setattr(discord_adapter_module.time, "monotonic", lambda: next(clock))
+
+        admitted = []
+        for message_id in range(1, 5):
+            message.id = message_id
+            admitted.append(adapter._discord_message_admission(message, claim=True)[0])
+
+        assert admitted == [True, True, True, False]
+        assert "reason=hop_cap hop=4 max_hops=4" in caplog.text
 
 
 class TestTwoAdapterChannelIsolation:
