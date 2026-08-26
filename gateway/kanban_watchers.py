@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -814,6 +815,24 @@ class GatewayKanbanWatchersMixin:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.handoff",
                                     summary=wake_handoff,
+                                )
+                            if task and task.contract:
+                                recipients = task.contract.get("recipient_ids") or []
+                                if isinstance(recipients, (list, tuple)) and recipients:
+                                    mentions = " ".join(
+                                        f"<@{str(r).strip()}>"
+                                        for r in recipients
+                                        if str(r).strip()
+                                    )
+                                    if mentions:
+                                        _synth += (
+                                            "\nRequired final-recipient mention(s): "
+                                            + mentions
+                                            + ". Do not omit them from the final reply."
+                                        )
+                                _synth += (
+                                    "\nContract: "
+                                    + json.dumps(task.contract, sort_keys=True)
                                 )
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"

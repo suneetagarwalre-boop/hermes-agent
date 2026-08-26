@@ -1072,6 +1072,10 @@ class Task:
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
+    # Durable goal contract carried across dispatcher → worker → reviewer.
+    # Keeps business/source scope, approvals, recipients, and acceptance
+    # criteria from being lost in conversational handoffs.
+    contract: Optional[dict] = None
     # Unified non-success counter. Incremented on any of:
     #   * spawn failure (dispatcher couldn't launch the worker)
     #   * timed_out outcome (worker exceeded max_runtime_seconds)
@@ -1174,6 +1178,11 @@ class Task:
             tenant=row["tenant"] if "tenant" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            contract=(
+                json.loads(row["contract_json"])
+                if "contract_json" in keys and row["contract_json"]
+                else None
+            ),
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
@@ -1353,6 +1362,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     tenant               TEXT,
     result               TEXT,
     idempotency_key      TEXT,
+    -- Durable machine-readable goal/scope/approval contract. Child tasks
+    -- inherit it unless an identical explicit contract is supplied.
+    contract_json        TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
     -- The circuit breaker in _record_task_failure trips when this
@@ -2546,6 +2558,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "contract_json" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "contract_json", "contract_json TEXT"
+        )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3170,6 +3186,7 @@ def create_task(
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
+    contract: Optional[dict] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
@@ -3348,6 +3365,48 @@ def create_task(
 
     parents = tuple(p for p in parents if p)
 
+    # Child work inherits the root goal contract. Conflicting parent contracts
+    # or attempts to alter an inherited scope fail closed.
+    parent_contracts: list[dict] = []
+    for parent_id in parents:
+        parent = get_task(conn, parent_id)
+        if parent is not None and parent.contract:
+            parent_contracts.append(parent.contract)
+    if parent_contracts:
+        inherited = parent_contracts[0]
+        if any(c != inherited for c in parent_contracts[1:]):
+            raise ValueError("parent tasks have conflicting goal contracts")
+        if contract is not None and contract != inherited:
+            raise ValueError("child contract cannot change inherited goal scope")
+        contract = inherited
+
+    contract_json: Optional[str] = None
+    if contract is not None:
+        if not isinstance(contract, dict):
+            raise ValueError("contract must be a JSON object")
+        required = ("goal_id", "business_domain", "source_system", "deliverable")
+        missing = [k for k in required if not str(contract.get(k) or "").strip()]
+        if missing:
+            raise ValueError(
+                "contract missing required field(s): " + ", ".join(missing)
+            )
+        contract_json = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+        # Equivalent contracted work in the same execution lane is retry-safe
+        # by default, even when the orchestrator forgot an idempotency key.
+        if not idempotency_key:
+            dedup_shape = {
+                "goal_id": contract["goal_id"],
+                "deliverable": contract["deliverable"],
+                "business_domain": contract["business_domain"],
+                "source_system": contract["source_system"],
+                "source_account": contract.get("source_account"),
+                "assignee": assignee,
+            }
+            digest = hashlib.sha256(
+                json.dumps(dedup_shape, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:24]
+            idempotency_key = f"contract:{digest}"
+
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
     # invisibly splatter a comma-joined string into one argv slot — the
@@ -3494,11 +3553,11 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
+                        contract_json, max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3515,6 +3574,7 @@ def create_task(
                         project_id,
                         tenant,
                         idempotency_key,
+                        contract_json,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
@@ -3552,6 +3612,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "contract": contract,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -5397,6 +5458,28 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    task_before = get_task(conn, task_id)
+    contract = task_before.contract if task_before else None
+    if contract and task_before is not None:
+        supplied = metadata if isinstance(metadata, dict) else {}
+        mismatches: list[str] = []
+        for key in ("business_domain", "source_system", "source_account"):
+            expected = contract.get(key)
+            if expected is None:
+                continue
+            actual = supplied.get(key)
+            if actual != expected:
+                mismatches.append(f"{key}: expected {expected!r}, got {actual!r}")
+        if mismatches:
+            raise ValueError(
+                "task contract validation failed; " + "; ".join(mismatches)
+            )
+        if contract.get("requires_review") and task_before.status != "review":
+            raise ValueError(
+                "task contract requires independent review before completion; "
+                "use kanban_request_review, then have the reviewer approve it"
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

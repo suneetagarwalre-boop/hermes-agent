@@ -1395,6 +1395,7 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    contract = args.get("contract")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1447,6 +1448,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
+                contract=contract,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
@@ -2236,6 +2238,18 @@ KANBAN_CREATE_SCHEMA = {
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
                 ),
+            },
+            "contract": {
+                "type": "object",
+                "description": (
+                    "Durable goal contract. Required keys: goal_id, "
+                    "business_domain, source_system, deliverable. May carry "
+                    "source_account, acceptance_criteria, exclusions, "
+                    "recipient_ids, approval, reply_owner_profile, and "
+                    "requires_review. Children inherit it and cannot change "
+                    "scope; equivalent contracted tasks deduplicate."
+                ),
+                "additionalProperties": True,
             },
             "max_runtime_seconds": {
                 "type": "integer",

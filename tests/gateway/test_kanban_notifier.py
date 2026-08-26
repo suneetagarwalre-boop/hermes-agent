@@ -514,6 +514,14 @@ def test_discord_wake_only_delivers_no_passive_duplicate(tmp_path, monkeypatch):
             title="single discord receipt",
             assignee="worker",
             session_id="origin-session",
+            contract={
+                "goal_id": "discord-canary",
+                "business_domain": "reside",
+                "source_system": "ghl",
+                "source_account": "reside-location",
+                "deliverable": "verified result",
+                "recipient_ids": ["12345"],
+            },
         )
         kb.add_notify_sub(
             conn,
@@ -523,7 +531,16 @@ def test_discord_wake_only_delivers_no_passive_duplicate(tmp_path, monkeypatch):
             chat_type="group",
             delivery_mode="wake",
         )
-        kb.complete_task(conn, tid, summary="verified result")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="verified result",
+            metadata={
+                "business_domain": "reside",
+                "source_system": "ghl",
+                "source_account": "reside-location",
+            },
+        )
     finally:
         conn.close()
 
@@ -536,6 +553,8 @@ def test_discord_wake_only_delivers_no_passive_duplicate(tmp_path, monkeypatch):
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.platform.value == "discord"
     assert adapter.handled[0].source.chat_id == "channel-1"
+    assert "<@12345>" in adapter.handled[0].text
+    assert '"business_domain": "reside"' in adapter.handled[0].text
 
 
 def _unseen_terminal_events_for(tid, chat_id):
