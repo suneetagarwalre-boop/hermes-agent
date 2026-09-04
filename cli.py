@@ -1452,6 +1452,22 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _single_query_exit_code(result) -> int:
+    """Map a structured one-shot result to the process exit contract."""
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+        "failure_reason"
+    ) in ("rate_limit", "billing"):
+        try:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+        except Exception:
+            pass
+    return 1
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -15771,7 +15787,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(self, message, images: Optional[list] = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -15792,6 +15808,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        # Preserve the structured turn outcome for one-shot callers. ``chat``
+        # historically returns only the visible response string, which meant
+        # non-quiet ``hermes chat -q`` could not distinguish a provider failure
+        # response from a successful answer and therefore exited 0.
+        self._last_turn_result = None
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -16336,6 +16358,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # sleep lets the renderer actually paint it before we draw.
             sys.stdout.flush()
             time.sleep(0.15)
+
+            # Expose the structured outcome before rendering it. The one-shot
+            # runner uses this after ``chat`` returns to choose its process exit
+            # code without changing chat's public string return type.
+            self._last_turn_result = result
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
@@ -20910,20 +20937,7 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        sys.exit(_single_query_exit_code(result))
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
@@ -20947,8 +20961,16 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                _response = cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _turn_result = getattr(cli, "_last_turn_result", None)
+                _exit_code = _single_query_exit_code(_turn_result)
+                if _exit_code:
+                    sys.exit(_exit_code)
+                if _response is None:
+                    # Credential refresh / agent initialization failures return
+                    # no structured result, but are still failed one-shot runs.
+                    sys.exit(1)
         finally:
             _finalize_single_query(cli)
         return
