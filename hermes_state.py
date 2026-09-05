@@ -2696,6 +2696,12 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     connect would disable the guard for the lifetime of that connection,
     which is precisely the failure mode this module exists to prevent.
     """
+    # Cross-thread statement caches can be entered during native statement
+    # deallocation. Disable that optimization for shared connections: the
+    # observed CPython 3.11 SIGSEGV was in bounded_lru_cache_wrapper's dict.
+    # This removes that crash path; it does not replace caller lifetime locks.
+    if kwargs.get("check_same_thread") is False:
+        kwargs["cached_statements"] = 0
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
