@@ -177,6 +177,19 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    @staticmethod
+    def _kanban_confirm_delivery(sub, event_id, message_id, board_slug):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_delivery import confirm
+        conn = kb.connect(board=board_slug)
+        try:
+            with kb.write_txn(conn):
+                confirm(conn, task_id=sub["task_id"], event_id=event_id,
+                        platform=sub["platform"], chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "", message_id=message_id)
+        finally:
+            conn.close()
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -344,6 +357,20 @@ class GatewayKanbanWatchersMixin:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        if _gc_due:
+                            import sqlite3
+                            from hermes_cli.kanban_delivery import undelivered_terminal
+                            try:
+                                audit = sqlite3.connect(f"file:{resolved_db_path}?mode=ro", uri=True)
+                                audit.row_factory = sqlite3.Row
+                                try:
+                                    missing = undelivered_terminal(audit)
+                                    if missing:
+                                        logger.warning("kanban delivery sweeper: agent-owned undelivered terminal cards on %s: %s", slug, missing)
+                                finally:
+                                    audit.close()
+                            except sqlite3.Error as exc:
+                                logger.debug("delivery audit not yet migrated: %s", exc)
                         # Zero-subscription early exit: probe the board with a
                         # cheap read-only connection BEFORE the writable
                         # `connect()`. A board with no subscriptions has
@@ -443,6 +470,11 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     if not events:
                                         continue
+                                    if platform == "discord":
+                                        from hermes_cli.kanban_delivery import receipt
+                                        events = [ev for ev in events if not receipt(
+                                            conn, sub["task_id"], ev.id, platform,
+                                            sub["chat_id"], sub.get("thread_id") or "")]
                                     task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
@@ -542,7 +574,10 @@ class GatewayKanbanWatchersMixin:
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
+                            if task and task.result:
+                                handoff = "\n" + task.result
+                                wake_handoff = payload_summary or task.result
+                            elif payload_summary:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
                                 handoff = f"\n{h}"
@@ -684,6 +719,11 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            if platform_str == "discord":
+                                await asyncio.to_thread(
+                                    self._kanban_confirm_delivery, sub, ev.id,
+                                    getattr(_send_res, "message_id", None), board_slug,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -724,11 +764,11 @@ class GatewayKanbanWatchersMixin:
                             )
                             if fails >= MAX_SEND_FAILURES:
                                 logger.warning(
-                                    "kanban notifier: dropping subscription "
+                                    "kanban notifier: retaining subscription for leased retry "
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                # Retain the subscription; the durable lease retries after cooldown.
                                 sub_fail_counts.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
@@ -865,11 +905,11 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 if fails >= MAX_SEND_FAILURES:
                                     logger.warning(
-                                        "kanban notifier: dropping subscription "
+                                        "kanban notifier: retaining subscription for leased retry "
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    # Retain the subscription; the durable lease retries after cooldown.
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -965,11 +1005,11 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 if fails >= MAX_SEND_FAILURES:
                                     logger.warning(
-                                        "kanban notifier: dropping subscription "
+                                        "kanban notifier: retaining subscription for leased retry "
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    # Retain the subscription; the durable lease retries after cooldown.
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next

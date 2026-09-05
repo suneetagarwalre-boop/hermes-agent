@@ -2851,6 +2851,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    from hermes_cli.kanban_delivery import migrate as migrate_delivery
+    migrate_delivery(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -5537,7 +5539,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
-                (result, now, task_id),
+                (result if result is not None else summary, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -5555,7 +5557,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result if result is not None else summary, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -11878,6 +11880,20 @@ def claim_unseen_events_for_sub(
         if row is None:
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
+        lease = conn.execute(
+            "SELECT lease_old_cursor, lease_until FROM kanban_notify_subs "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if lease["lease_until"]:
+            if lease["lease_until"] > time.time():
+                return old_cursor, old_cursor, []
+            old_cursor = int(lease["lease_old_cursor"])
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id=?, lease_until=0 "
+                "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+                (old_cursor, task_id, platform, chat_id, thread_id or ""),
+            )
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -11893,6 +11909,11 @@ def claim_unseen_events_for_sub(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+        )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET lease_old_cursor=?, lease_until=? "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (old_cursor, int(time.time()) + 300, task_id, platform, chat_id, thread_id or ""),
         )
         return old_cursor, new_cursor, events
 
@@ -11911,6 +11932,10 @@ def advance_notify_cursor(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+        )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET lease_until=0 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
         )
 
 
@@ -11940,6 +11965,11 @@ def rewind_notify_cursor(
                 int(claimed_cursor),
             ),
         )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET lease_until=0 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+                (task_id, platform, chat_id, thread_id or ""),
+            )
     return cur.rowcount > 0
 
 
