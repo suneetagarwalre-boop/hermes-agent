@@ -178,8 +178,8 @@ def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
     # pre-existing task_terminal behavior, unrelated to the wake outcome.)
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
-    """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
+def test_wake_only_failure_cap_retains_subscription_and_retries(tmp_path, monkeypatch):
+    """The failure cap cools down delivery; lease expiry retries without loss."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
@@ -193,10 +193,33 @@ def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.handled) == 1
-    assert _subs(tid) == [], (
-        "subscription must drop after MAX_SEND_FAILURES consecutive "
-        "wake-only delivery failures, like text sends do"
-    )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "counter entry must clear when the subscription is dropped"
-    )
+    assert len(_subs(tid)) == 1, "failed delivery must retain its routing target"
+    assert runner._kanban_sub_fail_counts == {}, "failure counter resets for cooldown"
+
+    # A fresh notifier still respects the durable lease, preventing a hot loop.
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert recovered.handled == []
+
+    conn = kb.connect()
+    try:
+        lease = conn.execute(
+            "SELECT lease_old_cursor, last_event_id, lease_until "
+            "FROM kanban_notify_subs WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert lease["lease_old_cursor"] < lease["last_event_id"]
+        assert lease["lease_until"] > 0
+        # Expire only this test DB's lease; no sleeps or production mutations.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET lease_until=1 WHERE task_id=?", (tid,),
+            )
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.handled) == 1, "expired lease must redeliver the event"
+    assert recovered.sent == [], "wake-only retry must not add a text ping"
+    assert _unseen_terminal_events(tid) == [], "successful wake must advance the cursor"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.handled) == 1, "a successful wake must not be retried"
