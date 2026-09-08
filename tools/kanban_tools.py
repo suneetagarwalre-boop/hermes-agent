@@ -357,6 +357,77 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
+def finalize_current_worker_from_env(
+    result_text: Optional[str] = None, *, failed: bool = False,
+) -> bool:
+    """Guarantee a dispatcher-spawned worker leaves a terminal state behind.
+
+    A run that ends its turn without calling ``kanban_complete`` /
+    ``kanban_block`` leaves the card ``running``. Nothing observes that until
+    the claim TTL expires, at which point the dispatcher reclaims the card and
+    re-dispatches the SAME work — up to the protocol-violation budget. Two
+    cards in the 2026-09-01..07 window (33ad7486, 3b1350fd) exist only because
+    of that, and the re-dispatches around them burned five runs redoing work
+    that had already been done. Closing the run here catches the clean finish
+    at the only point that reliably observes it: the worker's own exit.
+
+    Deliberately narrow. It acts only when ALL of these hold:
+
+    * this process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``),
+    * the turn did not fail — a failed or rate-limited turn must stay
+      retryable and is the crash detector's business, not ours,
+    * the card is still ``running`` on THIS run id and THIS pid, so a card
+      already reclaimed and handed to another worker is never stolen back.
+
+    The closing run is stamped ``auto_finalized`` so a completion no model
+    explicitly reported stays auditable as such.
+
+    Returns True only if a terminal state was actually written.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or failed:
+        return False
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        run_id = int(run_id_raw) if run_id_raw else None
+    except (TypeError, ValueError):
+        run_id = None
+    try:
+        kb, conn = _connect()
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None or getattr(task, "status", None) != "running":
+                return False          # already terminal, or no longer ours
+            worker_pid = getattr(task, "worker_pid", None)
+            if worker_pid is not None and int(worker_pid) != os.getpid():
+                return False          # reclaimed and respawned elsewhere
+            current_run = getattr(task, "current_run_id", None)
+            if run_id is not None and current_run is not None and int(current_run) != run_id:
+                return False          # our run was already closed out
+            note = (
+                "Auto-finalized: the worker finished its turn without calling "
+                "kanban_complete or kanban_block. The run is closed here so the "
+                "card is not re-dispatched; the text above is the worker's own "
+                "final output and has NOT been reviewed."
+            )
+            body = f"{(result_text or '').strip()}\n\n{note}".strip()
+            return bool(kb.complete_task(
+                conn, tid,
+                result=body,
+                summary="auto-finalized (worker exited without a terminal call)",
+                metadata={"auto_finalized": True, "pid": os.getpid()},
+                expected_run_id=run_id,
+            ))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("auto-finalize: bridge failed", exc_info=True)
+        return False
+
+
 # Live operator-note injection: poll the worker's task for new comments and
 # fold them into the running agent via the OUT-OF-BAND steer channel, so a user
 # can "talk to" a running kanban task without the block → comment → unblock

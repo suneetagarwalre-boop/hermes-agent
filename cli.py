@@ -1436,9 +1436,39 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+def _finalize_kanban_worker(cli) -> None:
+    """Close this worker's kanban card if the turn ended without doing so.
+
+    Runs on every one-shot exit path (including ``sys.exit``, which unwinds
+    through the caller's ``finally``), so a worker that answers conversationally
+    and stops still records a terminal state instead of leaving the card
+    ``running`` for the dispatcher to reclaim and re-run.
+    """
+    try:
+        from tools.kanban_tools import finalize_current_worker_from_env
+
+        result = getattr(cli, "_last_turn_result", None)
+        # Fail CLOSED on a missing result. ``_last_turn_result`` is only set
+        # once ``chat`` has produced a structured outcome, so ``None`` means the
+        # turn never completed — a credential failure, an agent that never
+        # initialized, an exception on the way in. Reading that as "not failed"
+        # would auto-complete a card whose worker never ran, which is far worse
+        # than the re-dispatch this function exists to prevent.
+        if not isinstance(result, dict):
+            return
+        failed = bool(result.get("failed"))
+        text = result.get("response")
+        finalize_current_worker_from_env(
+            text if isinstance(text, str) else None, failed=failed,
+        )
+    except Exception:
+        logger.debug("kanban worker auto-finalize failed", exc_info=True)
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
+        _finalize_kanban_worker(cli)
         # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
         # can issue aux-LLM calls, and nothing after it may fail in a way
         # that loses the turn (#88583).

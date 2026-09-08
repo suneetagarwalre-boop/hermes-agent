@@ -429,6 +429,12 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# How many implementer<->reviewer rebuild/reject round trips a single card may
+# take before it stops being re-dispatched and parks as blocked for a human.
+# Three gives a genuine disagreement room to resolve; beyond that the pair is
+# restating itself, not converging (see request_changes).
+_REVIEW_ROUND_TRIP_LIMIT = 3
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -6812,7 +6818,24 @@ def request_changes(
         else:
             reviewer = None
 
+        # Convergence ceiling. A review handoff neither increments nor resets
+        # consecutive_failures, so the circuit breaker never sees a
+        # rebuild/reject cycle and the pair can trade the card forever: card
+        # t_b66565e8 ran 23 times over 47 minutes (bernie rebuilding, katt
+        # rejecting), converged on nothing, and was archived having delivered
+        # nothing. Past the ceiling the card stops going back to the
+        # implementer and parks as blocked so a human decides, which is the
+        # decision the loop was substituting for.
+        prior_round_trips = int(conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested'",
+            (task_id,),
+        ).fetchone()[0] or 0)
+        not_converging = prior_round_trips + 1 >= _REVIEW_ROUND_TRIP_LIMIT
+
         new_status = _landing_status_after_parents(conn, task_id)
+        if not_converging:
+            new_status = "blocked"
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6847,9 +6870,48 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "round_trip": prior_round_trips + 1,
+                "round_trip_limit": _REVIEW_ROUND_TRIP_LIMIT,
+                "not_converging": not_converging,
             },
             run_id=run_id,
         )
+        if not_converging:
+            stall_reason = (
+                f"review did not converge after {prior_round_trips + 1} "
+                f"rebuild/reject round trips between {implementer} and "
+                f"{reviewer or 'reviewer'}; parked for a human decision "
+                f"instead of re-dispatching. Latest reviewer objection: {reason}"
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_not_converging",
+                {
+                    "round_trips": prior_round_trips + 1,
+                    "limit": _REVIEW_ROUND_TRIP_LIMIT,
+                    "implementer": implementer,
+                    "reviewer": reviewer,
+                    "reason": stall_reason,
+                },
+                run_id=run_id,
+            )
+            # Emit the ordinary ``blocked`` event too. The gateway's notifier
+            # keys off TERMINAL_KINDS, and a card that parks silently is just a
+            # slower version of the loop it replaced — the whole point is that
+            # a human hears about it.
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": stall_reason,
+                    "kind": "review_not_converging",
+                    "recurrences": prior_round_trips + 1,
+                    "source_status": "review",
+                },
+                run_id=run_id,
+            )
     return True, implementer
 
 
