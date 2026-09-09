@@ -1577,6 +1577,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
 
+        if self._channel_response_addressed(message) is False:
+            return False, False
+
         role_authorized = False
         is_bot_author = bool(getattr(message.author, "bot", False))
         is_self_message = message.author == getattr(self._client, "user", None)
@@ -6973,6 +6976,57 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
 
+    def _channel_response_addressed(self, message: Any) -> Optional[bool]:
+        """Opt-in room trigger policy, independent of passive history intake.
+
+        Missing room policy returns None (legacy behavior). A configured room
+        and its threads require an inline mention; bot authors must also match
+        bot_ids. Humans retain explicit-mention addressability. One configured
+        direct_user_id may additionally address the bot by a name prefix or a
+        reply to it. This does not bypass authorization or channel allowlists.
+        DMs and all unconfigured channels retain their existing behavior.
+        """
+        if isinstance(message.channel, discord.DMChannel) or getattr(message, "guild", None) is None:
+            return None
+        policies = self.config.extra.get("channel_response_policy", {})
+        if not isinstance(policies, dict):
+            return False  # Malformed opt-in configuration fails closed.
+        # YAML treats unquoted snowflakes as integers; they name the same room.
+        policies = {str(key): value for key, value in policies.items()}
+        channel = message.channel
+        channel_id = str(getattr(channel, "id", ""))
+        parent_id = self._get_parent_channel_id(channel)
+        key = channel_id if channel_id in policies else parent_id
+        if key not in policies:
+            return None
+        policy = policies[key]
+        if not isinstance(policy, dict):
+            return False
+        author_id = str(getattr(message.author, "id", ""))
+        inline = self._self_is_raw_mentioned(message)
+        if getattr(message.author, "bot", False):
+            bot_ids = policy.get("bot_ids", [])
+            return inline and isinstance(bot_ids, list) and author_id in {str(uid) for uid in bot_ids}
+        if inline:
+            return True
+        if author_id != str(policy.get("direct_user_id", "")):
+            return False
+        if self._self_is_explicitly_mentioned(message):
+            return True  # Human reply-ping, never a bot reply-ping.
+        target = getattr(getattr(message, "reference", None), "resolved", None)
+        if target is not None and getattr(target, "author", None) == getattr(self._client, "user", None):
+            return True
+        names = policy.get("direct_names", [])
+        if not isinstance(names, list):
+            return False
+        content = (getattr(message, "content", "") or "").lstrip()
+        return any(
+            isinstance(name, str) and name.strip()
+            and re.match(r"@?" + re.escape(name.strip()) + r"(?=$|[\s,:!?—–-])", content, re.IGNORECASE)
+            is not None
+            for name in names
+        )
+
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
 
@@ -8311,6 +8365,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         is_voice_linked_channel = False
 
+        # Apply the same room gate on live, recovery, and direct handle paths,
+        # before mention stripping or any reaction/thread/model side effect.
+        channel_addressed = self._channel_response_addressed(message)
+        if channel_addressed is False:
+            return False
+
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
         raw_content = message.content.strip()
@@ -8377,8 +8437,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
+            if channel_addressed is not None:
+                # A room-specific trigger policy overrides ambient/participated
+                # thread shortcuts and leaves passive history backfill enabled.
+                require_mention = True
+                is_free_channel = False
+                in_bot_thread = False
+
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if not channel_addressed and not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -10584,6 +10651,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
+    if "channel_response_policy" in discord_cfg:
+        seeded_extra["channel_response_policy"] = discord_cfg["channel_response_policy"]
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only

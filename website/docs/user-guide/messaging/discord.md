@@ -280,6 +280,41 @@ The bot should come online in Discord within a few seconds. Send it a message â€
 You can run `hermes gateway` in the background or as a systemd service for persistent operation. See the deployment docs for details.
 :::
 
+## Room-specific quiet context and response triggers
+
+For a room where bot updates should be background context rather than new
+requests, remove that room from `free_response_channels`, keep
+`history_backfill: true`, and add it to `no_thread_channels` if replies should
+stay inline. With `DISCORD_ALLOW_BOTS=mentions`, history includes other bots
+without making their unmentioned updates trigger agent runs. History is fetched
+on the next eligible turn, not continuously sent to the model; the normal
+`history_backfill_limit` and last-self-message boundary still apply.
+
+An optional per-profile `discord.channel_response_policy` further restricts
+message triggers for named channel IDs and their threads:
+
+```yaml
+discord:
+  require_mention: true
+  history_backfill: true
+  no_thread_channels: ['123456789012345678']
+  channel_response_policy:
+    '123456789012345678':
+      bot_ids: ['234567890123456789']
+      direct_user_id: '345678901234567890'
+      direct_names: [Helper]
+```
+
+In that room, admitted humans must type an inline bot mention. The configured
+`direct_user_id` may also start with `Helper` (case-insensitive, followed by
+whitespace/punctuation) or reply to the bot. Bots require both an inline mention
+and membership in `bot_ids`; automatic Discord reply-pings alone do not qualify.
+The policy cannot override user authorization, allowed/ignored channels, or the
+existing bot-loop guard. It overrides free-response and participated-thread
+shortcuts only in configured rooms. DMs and other rooms are unchanged. Empty
+`bot_ids` permits no bot triggers; numeric YAML snowflakes are accepted as IDs.
+This policy governs message events, not native slash-command access controls.
+
 ## Configuration Reference
 
 Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level toggles, and **`~/.hermes/config.yaml`** for structured settings. Environment variables always take precedence over config.yaml values when both are set.
