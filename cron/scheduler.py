@@ -5064,6 +5064,11 @@ def run_job(
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
 
+        # Opt-in canonical audit proof; no change to jobs without vault_audit.
+        from cron.audit_completion import completion_prompt, check_completion
+        _audit_completion_id, _audit_completion_prompt = completion_prompt(job)
+        prompt += _audit_completion_prompt
+
         # Mark this job as NOT the dispatcher-owned kanban worker.
         #
         # A kanban worker is a normal `hermes chat -q` CLI agent whose default
@@ -5822,7 +5827,13 @@ def run_job(
 {logged_response}
 """
         
-        logger.info("Job '%s' completed successfully", job_name)
+        _completion_error = check_completion(job, _audit_completion_id, final_response)
+        if _completion_error:
+            output += f"\n\n**Status:** partial\n\n{_completion_error}\n"
+            final_response = f"PARTIAL: {_completion_error}\n\n{final_response}"
+            logger.warning("Job '%s' completed partially: %s", job_name, _completion_error)
+        else:
+            logger.info("Job '%s' completed successfully", job_name)
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
@@ -5838,9 +5849,9 @@ def run_job(
             "deliver_target": job.get("deliver"),
             "model": model or None,
             "duration_ms": _audit_duration_ms,
-            "error": None,
+            "error": _completion_error,
         })
-        return True, output, final_response, None
+        return not bool(_completion_error), output, final_response, _completion_error
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -6416,6 +6427,13 @@ def _run_one_job_body(
                     "This alert is sent once; the job stays blocked until "
                     "the configuration is fixed."
                 )
+            elif (job.get("vault_audit") is not None and not success
+                  and (error or "").startswith("[PARTIAL_AUDIT]")):
+                # A local audit timeout is not a provider timeout. Preserve
+                # the partial business report instead of applying heuristics.
+                deliver_content = final_response or (
+                    f"PARTIAL: Cron '{job.get('name') or job['id']}': {error}"
+                )
             else:
                 deliver_content = final_response if success else (
                     _summarize_cron_failure_for_delivery(job, error)
@@ -6551,6 +6569,10 @@ def _run_one_job_body(
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
             mark_kwargs["status"] = "blocked_config"
+        elif job.get("vault_audit") is not None and not success:
+            from cron.audit_completion import PARTIAL_MARKER
+            if (error or "").startswith(PARTIAL_MARKER):
+                mark_kwargs["status"] = "partial"
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
             finish_execution(
