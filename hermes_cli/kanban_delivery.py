@@ -59,9 +59,16 @@ def confirm(conn, *, task_id, event_id, platform, chat_id, message_id, thread_id
         conn.execute('UPDATE tasks SET delivery_confirmed=1,delivery_message_id=?,delivery_confirmed_at=? WHERE id=?', (str(message_id),now,task_id))
 
 
-def undelivered_terminal(conn, *, limit=100):
-    """Read-only sweeper output: includes unroutable cards, never invents a target."""
-    return [dict(row) for row in conn.execute('''SELECT t.id,t.status,t.completed_at,
+def undelivered_terminal(conn, *, limit=100, routable_only=False):
+    """Read-only sweeper output; never invents a target.
+
+    ``routable_only`` keeps only cards with a live notify subscription — the
+    ones this notifier can still deliver. Cards without one are delivered by
+    their creator (Letterman's poller, Pryor monitor crons, the Monday
+    watcher) or have no audience at all, so they are not notifier failures.
+    """
+    routable = 'AND EXISTS(SELECT 1 FROM kanban_notify_subs s WHERE s.task_id=t.id)' if routable_only else ''
+    return [dict(row) for row in conn.execute(f'''SELECT t.id,t.status,t.completed_at,
         EXISTS(SELECT 1 FROM kanban_notify_subs s WHERE s.task_id=t.id) AS has_subscription
         FROM tasks t WHERE t.status IN ('done','blocked','review','triage')
-        AND t.delivery_confirmed=0 ORDER BY t.created_at DESC LIMIT ?''', (limit,)).fetchall()]
+        AND t.delivery_confirmed=0 {routable} ORDER BY t.created_at DESC LIMIT ?''', (limit,)).fetchall()]

@@ -34,6 +34,16 @@ def test_terminal_without_route_is_surfaced_not_confirmed(conn):
     assert any(r['id'] == tid and not r['has_subscription'] for r in delivery.undelivered_terminal(conn))
 
 
+def test_routable_only_excludes_cards_without_a_notify_target(conn):
+    unroutable, _ = completed(conn, summary='answer')
+    routable, _ = completed(conn, summary='answer')
+    kb.add_notify_sub(conn, task_id=routable, platform='discord', chat_id='42')
+    rows = delivery.undelivered_terminal(conn, routable_only=True)
+    ids = {r['id'] for r in rows}
+    assert routable in ids and unroutable not in ids
+    assert all(r['has_subscription'] for r in rows)
+
+
 def test_receipt_requires_message_and_correct_event(conn):
     tid, event = completed(conn, summary='answer')
     for message_id, eid in [(None,event), ('123',event+100)]:

@@ -364,7 +364,7 @@ class GatewayKanbanWatchersMixin:
                                 audit = sqlite3.connect(f"file:{resolved_db_path}?mode=ro", uri=True)
                                 audit.row_factory = sqlite3.Row
                                 try:
-                                    missing = undelivered_terminal(audit)
+                                    missing = undelivered_terminal(audit, routable_only=True)
                                     if missing:
                                         logger.warning("kanban delivery sweeper: agent-owned undelivered terminal cards on %s: %s", slug, missing)
                                 finally:
