@@ -5418,6 +5418,45 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _validate_completion_contract(
+    conn: sqlite3.Connection, task: Optional[Task], metadata: Optional[dict],
+) -> None:
+    """Validate source and review provenance against the supplied task snapshot.
+
+    Completion calls this both before artifact handling and under its write
+    lock. Only the exact active run's kernel claim can authorize completion
+    from ``running``; historical review events and caller metadata cannot.
+    Parked review retains the existing operator approval path.
+    """
+    if task is None or not task.contract:
+        return
+    contract = task.contract
+    supplied = metadata if isinstance(metadata, dict) else {}
+    mismatches: list[str] = []
+    for key in ("business_domain", "source_system", "source_account"):
+        expected = contract.get(key)
+        if expected is not None and supplied.get(key) != expected:
+            mismatches.append(
+                f"{key}: expected {expected!r}, got {supplied.get(key)!r}"
+            )
+    if mismatches:
+        raise ValueError("task contract validation failed; " + "; ".join(mismatches))
+    if not contract.get("requires_review") or task.status == "review":
+        return
+    if task.status == "running" and task.current_run_id is not None:
+        active = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL",
+            (task.current_run_id, task.id),
+        ).fetchone()
+        if active and _retry_status_for_run(conn, task.id, task.current_run_id) == "review":
+            return
+    raise ValueError(
+        "task contract requires independent review before completion; "
+        "use kanban_request_review, then have the reviewer approve it"
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5468,26 +5507,11 @@ def complete_task(
         return False
 
     task_before = get_task(conn, task_id)
-    contract = task_before.contract if task_before else None
-    if contract and task_before is not None:
-        supplied = metadata if isinstance(metadata, dict) else {}
-        mismatches: list[str] = []
-        for key in ("business_domain", "source_system", "source_account"):
-            expected = contract.get(key)
-            if expected is None:
-                continue
-            actual = supplied.get(key)
-            if actual != expected:
-                mismatches.append(f"{key}: expected {expected!r}, got {actual!r}")
-        if mismatches:
-            raise ValueError(
-                "task contract validation failed; " + "; ".join(mismatches)
-            )
-        if contract.get("requires_review") and task_before.status != "review":
-            raise ValueError(
-                "task contract requires independent review before completion; "
-                "use kanban_request_review, then have the reviewer approve it"
-            )
+    if expected_run_id is not None and (
+        task_before is None or task_before.current_run_id != int(expected_run_id)
+    ):
+        return False
+    _validate_completion_contract(conn, task_before, metadata)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5525,11 +5549,15 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
-        prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = prior["status"] if prior else None
+        # Preflight can race a requeue, new claim, or contract change. Read
+        # the authoritative row and current-run provenance under this lock.
+        task_locked = get_task(conn, task_id)
+        if expected_run_id is not None and (
+            task_locked is None or task_locked.current_run_id != int(expected_run_id)
+        ):
+            return False
+        _validate_completion_contract(conn, task_locked, metadata)
+        prior_status = task_locked.status if task_locked else None
         if expected_run_id is None:
             cur = conn.execute(
                 """
