@@ -51,6 +51,7 @@ from hermes_cli.cli_shutdown import (  # noqa: F401,E402
     _arm_exit_watchdog,
     _emit_interrupted_session_end,
     _exit_watchdog_timeout,
+    _finalize_kanban_worker,
     _finalize_single_query,
     _float_env,
     _flush_logging_and_stdio,

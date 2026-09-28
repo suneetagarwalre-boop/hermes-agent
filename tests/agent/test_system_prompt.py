@@ -82,6 +82,15 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
     assert (agent._kanban_worker_guidance == KANBAN_GUIDANCE) is expected
 
 
+def test_kanban_guidance_routes_required_review_to_marshal():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "contract.requires_review=true" in KANBAN_GUIDANCE
+    assert "kanban_request_review" in KANBAN_GUIDANCE
+    assert "reviewer='marshal'" in KANBAN_GUIDANCE
+    assert "instead of `kanban_complete`" in KANBAN_GUIDANCE
+
+
 @pytest.mark.parametrize("task_id, owner, expected", [
     (None, True, False),        # interactive session with the kanban toolset enabled
     ("t_worker", True, True),   # the dispatcher-owned worker

@@ -133,6 +133,25 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    def _kanban_confirm_delivery(
+        self, sub: dict, event_id: int, message_id: Any, board: Optional[str] = None,
+    ) -> None:
+        """Persist provider-confirmed Discord delivery for one exact event."""
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli.kanban_delivery import confirm
+
+        conn = _kbc.connect(board=board)
+        try:
+            with _kb.write_txn(conn):
+                confirm(
+                    conn, task_id=sub["task_id"], event_id=event_id,
+                    platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "", message_id=message_id,
+                )
+        finally:
+            conn.close()
+
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
 

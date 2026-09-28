@@ -438,6 +438,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "contract": {
+            "type": "object",
+            "description": (
+                "Durable goal contract. Required keys: goal_id, business_domain, "
+                "source_system, deliverable. Children inherit it and cannot change scope; "
+                "equivalent contracted tasks deduplicate. Risky calendar, CRM, outbound, "
+                "money, historical, export, or multi-system cards must set "
+                "requires_review=true and reviewer_profile='marshal'."
+            ),
+            "additionalProperties": True,
+        },
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "

@@ -301,10 +301,28 @@ def _wait_for_oneshot_background_completions(cli) -> None:
         )
 
 
+def _finalize_kanban_worker(cli) -> None:
+    """Best-effort lifecycle close for a clean one-shot Kanban worker."""
+    result = getattr(cli, "_last_turn_result", None)
+    if not isinstance(result, dict):
+        return
+    from tools.kanban_tools import finalize_current_worker_from_env
+    text = result.get("final_response") or result.get("response")
+    finalize_current_worker_from_env(
+        text if isinstance(text, str) else None,
+        failed=bool(result.get("failed") or result.get("partial")
+                    or result.get("completed") is False),
+    )
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     from cli import _flush_one_shot_session_store, _notify_single_query_session_finalize, _run_cleanup, _wait_for_oneshot_background_completions
     try:
+        try:
+            _finalize_kanban_worker(cli)
+        except Exception:
+            logger.debug("kanban worker auto-finalize failed", exc_info=True)
         # Order matters: linger for spawned background work BEFORE any teardown (the
         # parent owns those children's stdout pipes); then the durable flush, since
         # memory-provider shutdown inside _run_cleanup can issue aux-LLM calls and

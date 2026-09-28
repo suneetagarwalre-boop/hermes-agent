@@ -368,16 +368,37 @@ def claim_unseen_events_for_sub(
     delivery failure.
     """
     with _kb.write_txn(conn):
-        old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
-        if old_cursor is None:
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        row = conn.execute(
+            "SELECT last_event_id, lease_old_cursor, lease_until "
+            "FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+            key,
+        ).fetchone()
+        if row is None:
             return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        lease_until = int(row["lease_until"] or 0)
+        if lease_until:
+            if lease_until > int(time.time()):
+                return old_cursor, old_cursor, []
+            old_cursor = int(row["lease_old_cursor"] or 0)
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id=?, lease_until=0 " + _SUB_KEY_WHERE,
+                (old_cursor, *key),
+            )
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
         )
         if not events:
             return old_cursor, old_cursor, []
-        _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
+        claimed = _cas_cursor(conn, key, new_cursor, old_cursor)
+        if claimed.rowcount != 1:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET lease_old_cursor=?, lease_until=? " + _SUB_KEY_WHERE,
+            (old_cursor, int(time.time()) + 300, *key),
+        )
         return old_cursor, new_cursor, events
 
 
@@ -400,7 +421,7 @@ def advance_notify_cursor(
 ) -> None:
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
+            "UPDATE kanban_notify_subs SET last_event_id = ?, lease_until = 0 " + _SUB_KEY_WHERE,
             (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
 
@@ -433,6 +454,11 @@ def rewind_notify_cursor(
     """
     with _kb.write_txn(conn):
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET lease_until=0 " + _SUB_KEY_WHERE,
+                _sub_key(task_id, platform, chat_id, thread_id),
+            )
     return cur.rowcount > 0
 
 

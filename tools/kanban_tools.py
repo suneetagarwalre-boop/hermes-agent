@@ -396,7 +396,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -578,6 +578,61 @@ def heartbeat_current_worker_from_env() -> bool:
         return succeeded
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+
+def finalize_current_worker_from_env(
+    result_text: Optional[str] = None, *, failed: bool = False,
+) -> bool:
+    """Close a clean dispatcher worker turn that omitted a lifecycle tool.
+
+    The exact run id and pid fence stale workers. Review-required cards move to
+    their contracted reviewer instead of bypassing the review gate.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or failed or _is_delegated_child_context():
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return False
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            task = kb.get_task(conn, tid)
+            if task is None or task.status != "running":
+                return False
+            if task.worker_pid is not None and int(task.worker_pid) != os.getpid():
+                return False
+            if task.current_run_id != run_id:
+                return False
+            text = (result_text or "").strip()
+            note = (
+                "Auto-finalized: the worker finished its turn without calling a "
+                "Kanban lifecycle tool. This is the worker's unreviewed final output."
+            )
+            summary = f"{text}\n\n{note}".strip()
+            contract = task.goal_contract if isinstance(task.goal_contract, dict) else {}
+            metadata = {
+                "auto_finalized": True,
+                "pid": os.getpid(),
+                **{
+                    key: contract[key]
+                    for key in ("business_domain", "source_system", "source_account")
+                    if contract.get(key) is not None
+                },
+            }
+            if contract.get("requires_review"):
+                reviewer = contract.get("reviewer_profile") or contract.get("reviewer") or "marshal"
+                return bool(kb.request_review(
+                    conn, tid, summary=summary, metadata=metadata,
+                    reviewer=str(reviewer), expected_run_id=run_id,
+                ))
+            return bool(kb.complete_task(
+                conn, tid, result=summary,
+                summary="auto-finalized (worker exited without a lifecycle call)",
+                metadata=metadata, expected_run_id=run_id,
+            ))
+    except Exception:
+        logger.debug("auto-finalize: bridge failed", exc_info=True)
         return False
 
 
@@ -840,7 +895,18 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        task = kb.get_task(conn, tid)
+        if reviewer is None and task is not None and isinstance(task.goal_contract, dict):
+            reviewer = task.goal_contract.get("reviewer_profile") or task.goal_contract.get("reviewer")
+            if task.goal_contract.get("requires_review") and not reviewer:
+                reviewer = "marshal"
+            if reviewer:
+                reviewer = str(reviewer)
+                from hermes_cli.profiles import list_profile_names, profile_exists
+                _check(profile_exists(reviewer),
+                       f"reviewer profile {reviewer!r} is not installed. "
+                       f"Installed profiles: {', '.join(list_profile_names())}")
+        _goal_gate("kanban_request_review", task, tid, summary)
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
@@ -1029,6 +1095,37 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+_REVIEW_GATE_KEYWORDS = (
+    "calendar", "schedule", "scheduling", "book", "booking", "invite", "reschedule",
+    "crm", "ghl", "followupboss", "fub", "contact list", "contacts", "lead list",
+    "export", "send", "text", "sms", "email", "outbound", "newsletter send",
+    "money", "spend", "budget", "ad spend", "campaign budget", "historical", "all-time",
+    "multi-system", "cross-account", "source discovery", "zoom attendance",
+)
+
+
+def _validate_marshal_review_contract(title, body, assignee, contract) -> Optional[str]:
+    text = " ".join(str(value or "") for value in (title, body, assignee)).casefold()
+    if isinstance(contract, dict):
+        text += " " + json.dumps(contract, sort_keys=True, default=str).casefold()
+    hits = [keyword for keyword in _REVIEW_GATE_KEYWORDS if keyword in text]
+    if not hits:
+        return None
+    if not isinstance(contract, dict):
+        return "risky kanban_create requires a durable contract with requires_review=true"
+    required = ("goal_id", "business_domain", "source_system", "deliverable")
+    missing = [key for key in required if not str(contract.get(key) or "").strip()]
+    if missing:
+        return "risky kanban_create contract missing required field(s): " + ", ".join(missing)
+    if contract.get("requires_review") is not True:
+        return "risky kanban_create must set contract.requires_review=true"
+    reviewer = str(contract.get("reviewer_profile") or contract.get("reviewer") or "").strip().casefold()
+    if reviewer and reviewer != "marshal":
+        return "risky kanban_create reviewer_profile must be 'marshal'"
+    contract["reviewer_profile"] = "marshal"
+    return None
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1051,6 +1148,9 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    contract = args.get("contract")
+    review_contract_error = _validate_marshal_review_contract(title, args.get("body"), assignee, contract)
+    _check(not review_contract_error, review_contract_error or "invalid review contract")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1083,6 +1183,7 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            contract=contract,
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
@@ -1130,7 +1231,10 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         user_id=env("HERMES_SESSION_USER_ID", "") or None,
         user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
         notifier_profile=notifier_profile,
-        delivery_mode="notify+wake" if platform != "tui" else None,
+        delivery_mode=(
+            "wake" if platform.lower() == "discord"
+            else ("notify+wake" if platform != "tui" else None)
+        ),
         delivery_metadata=delivery_metadata or None)
 
 

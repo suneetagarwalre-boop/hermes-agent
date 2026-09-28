@@ -136,6 +136,93 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_create_risky_card_requires_marshal_review_contract(worker_env):
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_create({
+        "title": "Schedule JP call next week", "assignee": "alfred",
+        "body": "Book the calendar event after texting JP.",
+    }))
+    assert "requires a durable contract" in rejected["error"]
+
+    missing_review = json.loads(kt._handle_create({
+        "title": "Schedule JP call next week", "assignee": "alfred",
+        "body": "Book the calendar event after texting JP.",
+        "contract": {
+            "goal_id": "calendar-jp", "business_domain": "personal",
+            "source_system": "calendar", "deliverable": "book JP call",
+        },
+    }))
+    assert "requires_review=true" in missing_review["error"]
+
+
+def test_create_risky_card_stamps_marshal_reviewer(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "Schedule JP call next week", "assignee": "alfred",
+        "body": "Book the calendar event after texting JP.",
+        "contract": {
+            "goal_id": "calendar-jp", "business_domain": "personal",
+            "source_system": "calendar", "deliverable": "book JP call",
+            "requires_review": True,
+        },
+    }))
+    assert out.get("ok") is True
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+        assert task.contract["requires_review"] is True
+        assert task.contract["reviewer_profile"] == "marshal"
+    finally:
+        conn.close()
+
+
+def test_request_review_defaults_to_contract_reviewer(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "Schedule JP call next week", "assignee": "alfred",
+        "body": "Book the calendar event after texting JP.",
+        "contract": {
+            "goal_id": "calendar-jp", "business_domain": "personal",
+            "source_system": "calendar", "deliverable": "book JP call",
+            "requires_review": True, "reviewer_profile": "marshal",
+        },
+    }))
+    task_id = created["task_id"]
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        claimed = kb.claim_task(conn, task_id, claimer="alfred:test")
+        assert claimed is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "alfred")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["alfred", "marshal"])
+
+    review = json.loads(kt._handle_request_review({
+        "summary": "Booked after union free/busy; needs review before Done.",
+        "metadata": {"business_domain": "personal", "source_system": "calendar"},
+    }))
+    assert review.get("ok") is True
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "review"
+        assert task.assignee == "marshal"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

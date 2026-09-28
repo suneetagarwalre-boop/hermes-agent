@@ -831,12 +831,16 @@ _LATER_TASK_COLUMNS = (
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
+    ("goal_contract_json", "goal_contract_json TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("delivery_confirmed", "delivery_confirmed INTEGER NOT NULL DEFAULT 0"),
+    ("delivery_message_id", "delivery_message_id TEXT"),
+    ("delivery_confirmed_at", "delivery_confirmed_at INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -849,6 +853,8 @@ _NOTIFY_SUB_COLUMNS = (
     # (which prefers ``user_id_alt``). NULL is inert.
     ("user_id_alt", "user_id_alt TEXT"),
     ("delivery_metadata", "delivery_metadata TEXT"),
+    ("lease_old_cursor", "lease_old_cursor INTEGER NOT NULL DEFAULT 0"),
+    ("lease_until", "lease_until INTEGER NOT NULL DEFAULT 0"),
 )
 
 _TASK_RUN_COLUMNS = (
@@ -934,6 +940,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             if name not in run_cols:
                 _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
+
+    from hermes_cli.kanban_delivery import migrate as migrate_delivery
+    migrate_delivery(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.

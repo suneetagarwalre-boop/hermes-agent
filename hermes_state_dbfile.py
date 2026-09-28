@@ -577,6 +577,10 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     EXCLUSIVE).  The ONLY tolerated fallback is the helper being absent (scaffold/embed installs
     without hermes_cli); a real connection failure must propagate — a silent untracked retry
     would disable the guard for that connection."""
+    # Shared connections can finalize prepared statements on a different thread. Disable
+    # CPython's statement cache for that mode; caller-owned lifetime locks remain required.
+    if kwargs.get("check_same_thread") is False:
+        kwargs["cached_statements"] = 0
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:

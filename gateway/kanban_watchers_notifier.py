@@ -57,10 +57,8 @@ def diagnostic_event(ev) -> bool:
 # subscription was deleted after the first event. Same shape as the reblock-after-unblock cycle that PR
 # #22941 fixed for `blocked`. Keeping the subscription alive until the task is archived lets the cursor
 # (advanced atomically by claim_unseen_events_for_sub) handle dedup, and any retry-loop event reaches the
-# user. Per-subscription send-failure counter. Adapter.send raising means the chat is dead (deleted, bot
-# kicked, etc.) — after N consecutive send failures the sub is dropped so we don't spin against a dead chat
-# every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
-# unattended gate where a false drop means silent work pileup.
+# Per-subscription send-failure counter. At the cap, retain the durable route
+# and let its lease cool down instead of permanently losing the result.
 MAX_SEND_FAILURES = 12
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
@@ -284,6 +282,16 @@ class _Collector:
                             _purged, slug, self.gc_retention_days)
         except Exception as _gc_exc:
             logger.debug("kanban notifier: stale-sub GC failed for board %s: %s", slug, _gc_exc)
+        try:
+            from hermes_cli.kanban_delivery import undelivered_terminal
+            missing = undelivered_terminal(conn, routable_only=True)
+            if missing:
+                logger.warning(
+                    "kanban delivery sweeper: provider-unconfirmed routable Discord cards on %s: %s",
+                    slug, missing,
+                )
+        except Exception as exc:
+            logger.debug("kanban delivery audit unavailable on %s: %s", slug, exc)
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
@@ -527,21 +535,22 @@ class _KanbanNotification:
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
 
-    async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+    async def delivery_failed(self, fmt: str, prefix: tuple, cap_fmt: str, exc: Exception, exc_info: bool) -> None:
+        """Bump failures; at the cap keep the route and lease for a cool-down retry."""
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
         if fails >= MAX_SEND_FAILURES:
-            logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
-            await self.unsub()
+            logger.warning(cap_fmt, self.task_id, self.platform_str, fails)
+            # Do not rewind: the unexpired durable lease prevents a hot loop.
+            # Its expiry restores lease_old_cursor and retries this event.
             self.clear_failures()
         else:
             await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
-        drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
-        await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
+        cap_fmt = "kanban notifier: retaining subscription %s on %s after %d consecutive wake failures"
+        await self.delivery_failed(fmt, (self.task_id,), cap_fmt, exc, True)
 
     # -- formatting --
 
@@ -679,6 +688,11 @@ class _KanbanNotification:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+        if self.platform_str == "discord":
+            await _to_thread_process_service(
+                self.runner._kanban_confirm_delivery, sub, ev.id,
+                getattr(_send_res, "message_id", None), self.board_slug,
+            )
         # Upload artifact paths from the handoff payload / legacy result as
         # native files. Both handoff kinds stage files for exactly this: a
         # review-bound card's files exist precisely so the human sees them at
@@ -726,7 +740,7 @@ class _KanbanNotification:
             except Exception as exc:
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
-                    "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
+                    "kanban notifier: retaining subscription %s on %s after %d consecutive send failures", exc, False,
                 )
                 return False
         return True

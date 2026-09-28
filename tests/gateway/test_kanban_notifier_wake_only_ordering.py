@@ -179,25 +179,43 @@ def test_notify_wake_failure_retries_without_repeating_ping(tmp_path, monkeypatc
     assert list(runner._kanban_sub_fail_counts.values()) == [2]
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
-    """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
+def test_wake_only_failure_cap_retains_subscription_and_retries(tmp_path, monkeypatch):
+    """The cap cools down a durable lease; expiry retries without route loss."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
 
     adapter = FailingWakeAdapter()
     runner = _make_runner(adapter)
-    # Simulate 11 prior consecutive failures (MAX_SEND_FAILURES = 12).
-    runner._kanban_sub_fail_counts = {
-        (tid, "telegram", "chat-1", ""): 11,
-    }
+    runner._kanban_sub_fail_counts = {(tid, "telegram", "chat-1", ""): 11}
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.handled) == 1
-    assert _subs(tid) == [], (
-        "subscription must drop after MAX_SEND_FAILURES consecutive "
-        "wake-only delivery failures, like text sends do"
-    )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "counter entry must clear when the subscription is dropped"
-    )
+    assert len(_subs(tid)) == 1
+    assert runner._kanban_sub_fail_counts == {}
+
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert recovered.handled == []
+
+    conn = kbc.connect()
+    try:
+        lease = conn.execute(
+            "SELECT lease_old_cursor,last_event_id,lease_until "
+            "FROM kanban_notify_subs WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert lease["lease_old_cursor"] < lease["last_event_id"]
+        assert lease["lease_until"] > 0
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET lease_until=1 WHERE task_id=?", (tid,),
+            )
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.handled) == 1
+    assert recovered.sent == []
+    assert _unseen_terminal_events(tid) == []
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.handled) == 1

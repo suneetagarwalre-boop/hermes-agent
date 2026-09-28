@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from typing import Any, Iterable, Optional
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+_REVIEW_ROUND_TRIP_LIMIT = 3
 
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
@@ -738,6 +740,15 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    goal_contract: Optional[dict] = None
+    delivery_confirmed: Optional[int] = 0
+    delivery_message_id: Optional[str] = None
+    delivery_confirmed_at: Optional[int] = None
+
+    @property
+    def contract(self) -> Optional[dict]:
+        """Public tool/API name for the durable goal contract."""
+        return self.goal_contract
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -755,6 +766,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            goal_contract=_json_dict(g("goal_contract_json")) or None,
         )
 
 
@@ -768,6 +780,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "delivery_confirmed", "delivery_message_id", "delivery_confirmed_at",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -972,7 +985,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable machine-readable goal/scope/review contract inherited by child tasks.
+    goal_contract_json   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1066,7 +1081,20 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+    lease_old_cursor INTEGER NOT NULL DEFAULT 0,
+    lease_until INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_delivery_receipts (
+    task_id TEXT NOT NULL,
+    event_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    confirmed_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, event_id, platform, chat_id, thread_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
@@ -1266,6 +1294,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    contract: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1318,6 +1347,42 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+
+    # Child cards inherit one immutable goal contract; mixed scopes fail closed.
+    parent_contracts = [
+        parent.goal_contract
+        for parent_id in parents
+        if (parent := get_task(conn, parent_id)) is not None and parent.goal_contract
+    ]
+    if parent_contracts:
+        inherited = parent_contracts[0]
+        if any(candidate != inherited for candidate in parent_contracts[1:]):
+            raise ValueError("parent tasks have conflicting goal contracts")
+        if contract is not None and contract != inherited:
+            raise ValueError("child contract cannot change inherited goal scope")
+        contract = inherited
+
+    contract_json = None
+    if contract is not None:
+        if not isinstance(contract, dict):
+            raise ValueError("contract must be a JSON object")
+        required = ("goal_id", "business_domain", "source_system", "deliverable")
+        missing = [key for key in required if not str(contract.get(key) or "").strip()]
+        if missing:
+            raise ValueError("contract missing required field(s): " + ", ".join(missing))
+        contract_json = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+        # Equivalent contracted work is retry-safe even when the orchestrator omitted a key.
+        if not idempotency_key:
+            shape = {
+                key: contract.get(key)
+                for key in (
+                    "goal_id", "deliverable", "business_domain", "source_system", "source_account"
+                )
+            }
+            shape["assignee"] = assignee
+            digest = hashlib.sha256(json.dumps(shape, sort_keys=True).encode()).hexdigest()[:24]
+            idempotency_key = f"contract:{digest}"
+
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1365,8 +1430,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        goal_contract_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1375,7 +1441,8 @@ def create_task(
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
+                        completion_contract, contract_json,
                     ),
                 )
                 for pid in parents:
@@ -1398,6 +1465,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "contract": contract,
                     },
                 )
                 if task_status == "blocked":
@@ -2728,6 +2796,37 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _validate_goal_completion_contract(
+    conn: sqlite3.Connection, task: Optional[Task], metadata: Optional[dict],
+) -> None:
+    """Validate durable scope and current review provenance for a completion snapshot."""
+    if task is None or not task.goal_contract:
+        return
+    contract = task.goal_contract
+    supplied = metadata if isinstance(metadata, dict) else {}
+    mismatches = []
+    for key in ("business_domain", "source_system", "source_account"):
+        expected = contract.get(key)
+        if expected is not None and supplied.get(key) != expected:
+            mismatches.append(f"{key}: expected {expected!r}, got {supplied.get(key)!r}")
+    if mismatches:
+        raise ValueError("task contract validation failed; " + "; ".join(mismatches))
+    if not contract.get("requires_review") or task.status == "review":
+        return
+    if task.status == "running" and task.current_run_id is not None:
+        run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id=? AND task_id=? AND status='running' "
+            "AND ended_at IS NULL",
+            (task.current_run_id, task.id),
+        ).fetchone()
+        if run and _retry_status_for_run(conn, task.id, task.current_run_id) == "review":
+            return
+    raise ValueError(
+        "task contract requires independent review before completion; "
+        "use kanban_request_review, then have the reviewer approve it"
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2755,6 +2854,12 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    task_before = get_task(conn, task_id)
+    if expected_run_id is not None and (
+        task_before is None or task_before.current_run_id != int(expected_run_id)
+    ):
+        return False
+    _validate_goal_completion_contract(conn, task_before, metadata)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2770,6 +2875,12 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        task_locked = get_task(conn, task_id)
+        if expected_run_id is not None and (
+            task_locked is None or task_locked.current_run_id != int(expected_run_id)
+        ):
+            return False
+        _validate_goal_completion_contract(conn, task_locked, metadata)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
@@ -2795,7 +2906,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
-        params: tuple = (result, now, task_id)
+        params: tuple = (result if result is not None else summary, now, task_id)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -3535,7 +3646,13 @@ def request_changes(
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        prior_round_trips = int(conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()[0] or 0)
+        round_trip = prior_round_trips + 1
+        not_converging = round_trip >= _REVIEW_ROUND_TRIP_LIMIT
+        new_status = "blocked" if not_converging else _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         cur = conn.execute(
@@ -3564,9 +3681,30 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "round_trip": round_trip,
+                "round_trip_limit": _REVIEW_ROUND_TRIP_LIMIT,
+                "not_converging": not_converging,
             },
             run_id=run_id,
         )
+        if not_converging:
+            stall_reason = (
+                f"review did not converge after {round_trip} rebuild/reject round trips "
+                f"between {implementer} and {reviewer or 'reviewer'}; parked for a human "
+                f"decision. Latest reviewer objection: {reason}"
+            )
+            _append_event(
+                conn, task_id, "review_not_converging",
+                {"round_trips": round_trip, "limit": _REVIEW_ROUND_TRIP_LIMIT,
+                 "implementer": implementer, "reviewer": reviewer, "reason": stall_reason},
+                run_id=run_id,
+            )
+            _append_event(
+                conn, task_id, "blocked",
+                {"reason": stall_reason, "kind": "review_not_converging",
+                 "recurrences": round_trip, "source_status": "review"},
+                run_id=run_id,
+            )
     return True, implementer
 
 
