@@ -2503,8 +2503,12 @@ def run_job(
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
+    _audit_completion_id = None
     try:
         scope.enter()
+        from cron.audit_completion import completion_prompt
+        _audit_completion_id, _audit_completion_prompt = completion_prompt(job)
+        prompt = str(prompt or "") + _audit_completion_prompt
         if scope.workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, scope.workdir)
         _reload_dotenv_and_publish_delivery_target(job)
@@ -2536,9 +2540,19 @@ def run_job(
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
-        logger.info("Job '%s' completed successfully", job_name)
-        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        return True, output, final_response, None
+        from cron.audit_completion import check_completion
+        completion_error = check_completion(job, _audit_completion_id, final_response)
+        if completion_error:
+            output += f"\n**Status:** partial\n\n{completion_error}\n"
+            final_response = f"PARTIAL: {completion_error}\n\n{final_response}"
+            logger.warning("Job '%s' completed partially: %s", job_name, completion_error)
+        else:
+            logger.info("Job '%s' completed successfully", job_name)
+        _audit.write(
+            dict(result, response_silent=_is_cron_silence_response(final_response or "")),
+            completion_error,
+        )
+        return not bool(completion_error), output, final_response, completion_error
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -2852,6 +2866,9 @@ def _compose_run_delivery(
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
+    elif job.get("vault_audit") is not None and err.startswith("[PARTIAL_AUDIT]"):
+        # This is a verified business/audit partial, not a provider failure.
+        deliver_content = final_response or f"PARTIAL: {err}"
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3082,6 +3099,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    elif job.get("vault_audit") is not None and str(d.error or "").startswith("[PARTIAL_AUDIT]"):
+        mark_kwargs["status"] = "partial"
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)
