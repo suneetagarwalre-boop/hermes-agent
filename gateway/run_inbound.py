@@ -1423,9 +1423,12 @@ class GatewayInboundMixin:
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
             # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
             # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
-            # See #17916.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
+            # Slack and Discord expose the current author's immutable platform ID next to the
+            # display name. The name is attribution only; mention routing and authority checks
+            # must bind to the current event envelope, not a renameable label.
+            if source.platform in {Platform.SLACK, Platform.DISCORD} and source.user_id:
+                platform_label = "Slack" if source.platform == Platform.SLACK else "Discord"
+                _safe_user_name = f"{_safe_user_name} | {platform_label} user <@{source.user_id}>"
             message_text = f"[{_safe_user_name}] {message_text}"
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):

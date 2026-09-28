@@ -221,6 +221,42 @@ class TestSlashGateIsolation:
         assert allowed_b is False
         assert reason_b == "channel not in DISCORD_ALLOWED_CHANNELS"
 
+    def test_slash_operator_ids_narrow_broad_message_access(self, monkeypatch):
+        import types
+
+        pytest.importorskip("discord", reason="discord.py optional dep not installed")
+        adapter = _adapter()
+        _snapshot(
+            adapter,
+            {
+                "DISCORD_ALLOWED_USERS": "*",
+                "HERMES_SLASH_OPERATOR_IDS": "1001",
+            },
+        )
+        adapter._allowed_user_ids = {"*"}
+        monkeypatch.setattr(
+            DiscordAdapter, "_is_allowed_user", lambda self, uid, **kwargs: True
+        )
+
+        denied = types.SimpleNamespace(
+            channel=types.SimpleNamespace(id=111),
+            channel_id=111,
+            user=types.SimpleNamespace(id=2002, roles=[]),
+            guild=None,
+        )
+        allowed = types.SimpleNamespace(
+            channel=types.SimpleNamespace(id=111),
+            channel_id=111,
+            user=types.SimpleNamespace(id=1001, roles=[]),
+            guild=None,
+        )
+
+        assert adapter._evaluate_slash_authorization(denied) == (
+            False,
+            "user not in HERMES_SLASH_OPERATOR_IDS",
+        )
+        assert adapter._evaluate_slash_authorization(allowed) == (True, None)
+
 
 class TestUsernameResolutionEnvWrite:
     """_resolve_allowed_usernames must not clobber process env under multiplex."""

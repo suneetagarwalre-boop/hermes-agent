@@ -415,8 +415,10 @@ class GatewaySlashCommandsMixin(
                     # the same session key only when the alt id survives the round-trip.
                     user_id_alt=_field("user_id_alt"),
                     notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                    # Subscribing from chat: deliver the passive message and wake the destination agent.
-                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata)
+                    # Discord has one visible completion owner: wake the originating agent only,
+                    # rather than posting a passive receipt and then a second distilled reply.
+                    delivery_mode=("wake" if platform_str == "discord" else "notify+wake"),
+                    delivery_metadata=delivery_metadata)
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)

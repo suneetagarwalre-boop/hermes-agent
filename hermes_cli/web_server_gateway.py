@@ -21,25 +21,15 @@ _log = logging.getLogger("hermes_cli.web_server")
 
 
 def _probe_gateway_health() -> tuple[bool, dict | None]:
-    """Probe the gateway's HTTP health endpoint (cross-container). Blocking — run in an executor.
-
-    DEPRECATED: driven by the ``GATEWAY_HEALTH_URL`` / ``GATEWAY_HEALTH_TIMEOUT`` env vars,
-    to be replaced by a dashboard config key; do not add callers. Accepts a base URL or an
-    explicit ``/health`` / ``/health/detailed`` path; tries ``/health/detailed`` first.
-    """
+    """Probe the gateway's HTTP health endpoint with bounded, Hermes-stamped validation."""
     from hermes_cli.web_server import _GATEWAY_HEALTH_TIMEOUT, _GATEWAY_HEALTH_URL
-    if not _GATEWAY_HEALTH_URL:
-        return False, None
-    base = re.sub(r"/health(/detailed)?$", "", _GATEWAY_HEALTH_URL.rstrip("/"))
-    for path in (f"{base}/health/detailed", f"{base}/health"):
-        try:
-            req = urllib.request.Request(path, method="GET")
-            with urllib.request.urlopen(req, timeout=_GATEWAY_HEALTH_TIMEOUT) as resp:
-                if resp.status == 200:
-                    return True, json.loads(resp.read())
-        except Exception:
-            continue
-    return False, None
+    from gateway.status import probe_gateway_health
+
+    return probe_gateway_health(
+        _GATEWAY_HEALTH_URL,
+        timeout=_GATEWAY_HEALTH_TIMEOUT,
+        urlopen=urllib.request.urlopen,
+    )
 
 
 # ``platform-name -> (config port key, adapter default)`` for port-binding gateway platforms.

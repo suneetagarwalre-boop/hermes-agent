@@ -47,3 +47,30 @@ async def test_preprocess_includes_slack_author_mention_for_shared_thread():
     assert result == "[Alice | Slack user <@U123>] mention me again"
 
 
+@pytest.mark.asyncio
+async def test_preprocess_includes_discord_author_mention_for_shared_thread():
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_name="team-channel",
+        chat_type="group",
+        user_id="456",
+        user_name="Alice",
+        thread_id="789",
+    )
+    event = MessageEvent(text="mention me again", source=source)
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == "[Alice | Discord user <@456>] mention me again"

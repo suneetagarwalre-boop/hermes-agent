@@ -427,7 +427,19 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
             "Multiple users may participate."
         )
     elif src.user_name:
-        lines.append(f"**User:** {_format_untrusted_prompt_value(src.user_name)}")
+        # Carry the immutable platform ID beside the renameable display name. Discord IDs stay
+        # literal even in PII-redacted prompts because the model needs the real ID to emit a valid
+        # <@user> mention; other platforms retain the existing hashing policy.
+        name = _format_untrusted_prompt_value(src.user_name)
+        uid = src.user_id
+        if uid and redact_pii and src.platform != Platform.DISCORD:
+            uid = _hash_sender_id(uid)
+        if uid:
+            lines.append(
+                f"**User:** {name} (platform user ID {_format_untrusted_prompt_value(uid)})"
+            )
+        else:
+            lines.append(f"**User:** {name}")
     elif src.user_id:
         uid = _hash_sender_id(src.user_id) if redact_pii else src.user_id
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")

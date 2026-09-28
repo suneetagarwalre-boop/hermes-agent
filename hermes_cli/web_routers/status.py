@@ -12,6 +12,7 @@ import re
 import asyncio
 import os
 import sys
+import threading
 import time
 from fastapi import APIRouter
 from hermes_cli.web_deps import LateState, late
@@ -61,6 +62,7 @@ _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.
 
 _STATUS_ACTIVE_SESSIONS_TIMEOUT = 0.75
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
+_gateway_health_probe_slots = threading.BoundedSemaphore(value=1)
 _HEALTHY_PLATFORM_STATES = {"connected", "running", "ok"}
 
 
@@ -243,16 +245,32 @@ def _bounded_health_probe():
     """Health probe with the route's blocking-call budget preserved. The resolver only
     reaches this rung when the local PID probe came up empty, so the timeout is paid at
     most once per request and only in the cross-container case that needs it."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_probe_gateway_health)
+    if not _gateway_health_probe_slots.acquire(blocking=False):
+        _log.warning("/api/status gateway health probe capacity exhausted; using local status")
+        return False, None
+    future = concurrent.futures.Future()
+
+    def _worker():
         try:
-            return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
-                         _GATEWAY_HEALTH_ROUTE_TIMEOUT)
-            return False, None
-        except Exception:
-            return False, None
+            future.set_result(_probe_gateway_health())
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            _gateway_health_probe_slots.release()
+
+    try:
+        threading.Thread(target=_worker, name="gateway-health-probe", daemon=True).start()
+    except Exception:
+        _gateway_health_probe_slots.release()
+        return False, None
+    try:
+        return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
+                     _GATEWAY_HEALTH_ROUTE_TIMEOUT)
+        return False, None
+    except Exception:
+        return False, None
 
 
 def _project_gateway_platforms(gateway_platforms: dict, configured: "set[str] | None",

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -390,6 +391,50 @@ def retained_gateway_state(runtime: Any) -> str:
         if rt.get("gateway_state") == "degraded" and rt.get("exit_reason") in WATCHDOG_EXIT_REASONS:
             return "degraded"
     return "stopped"
+
+
+_GATEWAY_HEALTH_VALID_STATUSES = frozenset({"ok", "degraded"})
+_GATEWAY_HEALTH_MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+def gateway_health_body_is_valid(body: Any) -> bool:
+    """Accept only a stamped Hermes health document, not an arbitrary HTTP 200."""
+    return (
+        isinstance(body, dict)
+        and body.get("platform") == "hermes-agent"
+        and str(body.get("status") or "").lower() in _GATEWAY_HEALTH_VALID_STATUSES
+    )
+
+
+def probe_gateway_health(
+    health_url: Optional[str], *, timeout: float = 1.0,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Probe detailed then simple health within one deadline and validate the response identity."""
+    if not health_url:
+        return False, None
+    base = re.sub(r"/health(/detailed)?$", "", health_url.rstrip("/"))
+    urls = (f"{base}/health/detailed", f"{base}/health")
+    deadline = time.monotonic() + timeout
+    for index, url in enumerate(urls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempt_timeout = remaining / (len(urls) - index)
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urlopen(req, timeout=attempt_timeout) as resp:
+                if getattr(resp, "status", None) != 200:
+                    continue
+                raw = resp.read(_GATEWAY_HEALTH_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > _GATEWAY_HEALTH_MAX_RESPONSE_BYTES:
+                    continue
+                body = json.loads(raw)
+        except Exception:
+            continue
+        if gateway_health_body_is_valid(body):
+            return True, body
+    return False, None
 
 
 def terminate_pid(

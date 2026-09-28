@@ -255,6 +255,11 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+try:
+    from .mention_rewriter import rewrite_plain_mentions
+except ImportError:
+    from mention_rewriter import rewrite_plain_mentions
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -555,7 +560,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
-    "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
+    "HERMES_SLASH_OPERATOR_IDS", "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
 
@@ -1444,6 +1449,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            return False, False
+        if self._channel_response_addressed(message) is False:
             return False, False
         role_authorized = False
         if getattr(message.author, "bot", False):
@@ -4056,6 +4063,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             channel_ids=channel_keys if not in_dm else None,
         ):
             return (False, "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES")
+        # Message addressability and control-plane authority are separate. An installation may
+        # deliberately allow a broad audience to mention the bot while reserving native slash
+        # commands for immutable operator IDs. Empty preserves the upstream allowlist behavior.
+        operator_ids = self._gate_csv_set(self._gate_env("HERMES_SLASH_OPERATOR_IDS"))
+        if operator_ids and "*" not in operator_ids and user_id not in operator_ids:
+            return (False, "user not in HERMES_SLASH_OPERATOR_IDS")
         return (True, None)
 
     async def _check_slash_authorization(
@@ -4341,7 +4354,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
         if not content:
             return content
-        return convert_table_to_bullets(content)
+        return rewrite_plain_mentions(convert_table_to_bullets(content))
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
@@ -4985,6 +4998,50 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client or not self._client.user:
             return False
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+
+    def _channel_response_addressed(self, message: Any) -> Optional[bool]:
+        """Room-specific trigger policy, independent of passive history intake."""
+        if isinstance(message.channel, discord.DMChannel) or getattr(message, "guild", None) is None:
+            return None
+        policies = self.config.extra.get("channel_response_policy", {})
+        if not isinstance(policies, dict):
+            return False
+        policies = {str(key): value for key, value in policies.items()}
+        channel = message.channel
+        channel_id = str(getattr(channel, "id", ""))
+        parent_id = self._get_parent_channel_id(channel)
+        key = channel_id if channel_id in policies else parent_id
+        if key not in policies:
+            return None
+        policy = policies[key]
+        if not isinstance(policy, dict):
+            return False
+        author_id = str(getattr(message.author, "id", ""))
+        inline = self._self_is_raw_mentioned(message)
+        if getattr(message.author, "bot", False):
+            bot_ids = policy.get("bot_ids", [])
+            return inline and isinstance(bot_ids, list) and author_id in {
+                str(user_id) for user_id in bot_ids
+            }
+        if inline:
+            return True
+        if author_id != str(policy.get("direct_user_id", "")):
+            return False
+        if self._self_is_explicitly_mentioned(message):
+            return True
+        target = getattr(getattr(message, "reference", None), "resolved", None)
+        if target is not None and getattr(target, "author", None) == getattr(self._client, "user", None):
+            return True
+        names = policy.get("direct_names", [])
+        if not isinstance(names, list):
+            return False
+        content = (getattr(message, "content", "") or "").lstrip()
+        return any(
+            isinstance(name, str) and name.strip()
+            and re.match(r"@?" + re.escape(name.strip()) + r"(?=$|[\s,:!?—–-])", content, re.IGNORECASE)
+            is not None
+            for name in names
+        )
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
@@ -5941,6 +5998,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
         is_voice_linked_channel = False
+        channel_addressed = self._channel_response_addressed(message)
+        if channel_addressed is False:
+            return False
         # Save stripped text now: create_thread() can clobber message.content (breaks /command detection).
         raw_content = message.content.strip()
         normalized_content = raw_content
@@ -5987,9 +6047,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
+            if channel_addressed is not None:
+                # A configured room policy overrides ambient/free-response and thread shortcuts.
+                is_free_channel = False
+                in_bot_thread = False
             if require_mention and not is_free_channel and not in_bot_thread:
                 if (
-                    not self._self_is_explicitly_mentioned(message)
+                    not channel_addressed
+                    and not self._self_is_explicitly_mentioned(message)
                     and not mention_prefix
                     and not self._is_bot_tag_debounce_continuation(message)
                 ):
@@ -6959,6 +7024,9 @@ async def _standalone_send(
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
+    message = rewrite_plain_mentions(message)
+    if caption:
+        caption = rewrite_plain_mentions(caption)
     try:
         import aiohttp
     except ImportError:
@@ -7252,6 +7320,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
+    if "channel_response_policy" in discord_cfg:
+        seeded_extra["channel_response_policy"] = discord_cfg["channel_response_policy"]
     for key, env_key in _YAML_BOOL_ENV_KEYS:
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]  # original type: the shared-key loop seeds bools as bools
@@ -7277,6 +7347,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
+    _gate("slash_operator_ids", "HERMES_SLASH_OPERATOR_IDS", from_platform_extra=True)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
