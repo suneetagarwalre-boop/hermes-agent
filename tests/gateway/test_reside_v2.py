@@ -381,4 +381,3 @@ def test_model_credential_missing_cannot_fall_back_to_any_pool(tmp_path,monkeypa
     link=tmp_path/'symlink.json'; link.symlink_to(other)
     monkeypatch.setattr(v2,'MODEL_AUTH_PATH',link)
     with pytest.raises(OSError): v2._model_token()
-

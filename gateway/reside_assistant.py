@@ -419,4 +419,3 @@ def respond(principal, text, token, event_id, *, complete=None, report=None, rat
             output += '\nLive status unavailable: corpus-only answer; no current operational findings.'
         return output
     finally: _LOCK.release()
-
