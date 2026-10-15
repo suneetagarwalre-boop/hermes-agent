@@ -3080,6 +3080,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
+            if final_delivery and self.config.extra.get("recipient_contract") is True:
+                from plugins.platforms.discord.recipient_contract import prepare_discord_message
+                prepare_discord_message(content, self.config.extra,
+                                        _build_allowed_mentions(self.config.extra), require_contract=True)
             if thread_id:
                 channel = await self._resolve_channel(thread_id)
                 if not channel:
@@ -3097,6 +3101,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             )
             message_ids = []
+            mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra)}
+                              if self.config.extra.get("action_mentions") is True else {})
             reference = self._reply_reference_for_send(reply_to, channel)
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
@@ -3104,7 +3110,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(content=chunk, reference=chunk_reference)
+                    msg = await channel.send(content=chunk, reference=chunk_reference, **mention_kwargs)
                 except Exception as e:
                     if chunk_reference is not None and self._is_reply_reference_rejected(e):
                         logger.warning(
@@ -3112,7 +3118,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             self.name, reply_to,
                         )
                         reference = None
-                        msg = await channel.send(content=chunk, reference=None)
+                        msg = await channel.send(content=chunk, reference=None, **mention_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -3250,6 +3256,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             channel = await self._resolve_channel(chat_id)
             msg = channel.get_partial_message(int(message_id))
+            if finalize and self.config.extra.get("recipient_contract") is True:
+                from plugins.platforms.discord.recipient_contract import prepare_discord_message
+                prepared = prepare_discord_message(content, self.config.extra,
+                    _build_allowed_mentions(self.config.extra), require_contract=True)
+                if prepared.startswith("<@"):
+                    return SendResult(success=False, error="Action/result recipients require a fresh Discord send; edits do not reliably notify recipients")
             formatted = self.format_message(content)
             _preview_key = (str(chat_id), str(message_id))
             _saturated_preview = False
@@ -4399,9 +4411,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
         if not content:
             return content
-        return rewrite_plain_mentions(
-            convert_table_to_bullets(content), self.config.extra.get("mention_roster_path"),
-            actionable=self.config.extra.get("action_mentions") is True)
+        from plugins.platforms.discord.recipient_contract import prepare_discord_message
+        return prepare_discord_message(
+            convert_table_to_bullets(content), self.config.extra,
+            _build_allowed_mentions(self.config.extra))
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
@@ -7072,13 +7085,15 @@ async def _standalone_send(
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
     mention_extra = getattr(pconfig, "extra", None) or {}
-    mention_kwargs = {"roster_path": mention_extra.get("mention_roster_path"),
-                      "actionable": mention_extra.get("action_mentions") is True}
     allowed = _build_allowed_mentions(mention_extra)
     allowed_payload = allowed.to_dict() if allowed is not None else {"parse": ["users"], "replied_user": False}
-    message = rewrite_plain_mentions(message, **mention_kwargs)
-    if caption:
-        caption = rewrite_plain_mentions(caption, **mention_kwargs)
+    from plugins.platforms.discord.recipient_contract import prepare_discord_message
+    try:
+        message = prepare_discord_message(message, mention_extra, allowed_payload)
+        if caption:
+            caption = prepare_discord_message(caption, mention_extra, allowed_payload)
+    except ValueError as exc:
+        return send_error(str(exc))
     try:
         import aiohttp
     except ImportError:

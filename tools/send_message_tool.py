@@ -692,6 +692,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
+    if platform_name == "discord":
+        # Resolve the serialized producer contract BEFORE splitting (also cron/media).
+        # Fail the entire logical send before the first network side effect.
+        from plugins.platforms.discord.recipient_contract import prepare_discord_message
+        from plugins.platforms.discord.adapter import _build_allowed_mentions
+        extra = getattr(pconfig, "extra", None) or {}
+        try:
+            message = prepare_discord_message(message, extra, _build_allowed_mentions(extra), require_contract=True)
+        except ValueError as exc:
+            return {"error": str(exc)}
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).
@@ -776,7 +786,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:~/.hermes/cache/scratch/report.pdf') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:~/.hermes/cache/scratch/report.pdf') in the message — the platform will deliver it as a native media attachment. For Discord profiles with action_mentions enabled, action requests, handoffs, and results owed to a named person MUST start with [[discord-recipients:[\"verified alias or ID\"]]] followed by the message. This structured recipient declaration is validated before splitting/delivery; unknown or ambiguous bindings and suppressed user mentions fail rather than silently sending. Do not infer recipients from narrative names; do not guess IDs. The declaration does not authorize a send."
             },
             "emoji": {
                 "type": "string",
