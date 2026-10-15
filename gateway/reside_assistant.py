@@ -125,7 +125,7 @@ def model_response(messages):
     from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
     from openai import OpenAI
     token = _model_token()
-    model = 'openai-codex/gpt-6.1-sol'
+    model = 'gpt-6.1-sol'  # native Codex wire slug; no provider prefix
     with OpenAI(api_key=token, base_url=CODEX_AUX_BASE_URL, timeout=60,
             max_retries=0, default_headers=codex_cloudflare_headers(token, base_url=CODEX_AUX_BASE_URL)) as transport:
         client = CodexAuxiliaryClient(transport, model)
