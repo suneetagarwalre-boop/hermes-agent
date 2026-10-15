@@ -699,12 +699,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         from plugins.platforms.discord.adapter import _build_allowed_mentions
         extra = getattr(pconfig, "extra", None) or {}
         try:
-            message = prepare_discord_message(message, extra, _build_allowed_mentions(extra), require_contract=True)
+            allowed = _build_allowed_mentions(extra, message)
+            from plugins.platforms.discord.recipient_contract import recipient_mention_policy
+            policy = recipient_mention_policy(message, extra, allowed)
+            message = prepare_discord_message(message, extra, allowed, require_contract=True)
             if extra.get("action_mentions") is True:
                 # This logical send is already validated/prepared before splitting.
                 # Do not apply legacy vocative inference again to each chunk/caption.
                 from dataclasses import replace
-                pconfig = replace(pconfig, extra={**extra, "action_mentions": False})
+                pconfig = replace(pconfig, extra={**extra, "action_mentions": False,
+                    **({"_prepared_recipient_policy": policy} if policy is not None else {})})
         except ValueError as exc:
             return {"error": str(exc)}
     if platform == Platform.WEIXIN:

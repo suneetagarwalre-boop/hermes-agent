@@ -46,7 +46,7 @@ def prepare_discord_message(text, extra, allowed, *, require_contract=False):
         resolved = []
         for recipient in recipients:
             uid = recipient if recipient in ids else aliases.get(recipient.casefold())
-            if not uid:
+            if not uid or not re.fullmatch(r"[1-9][0-9]{16,19}", uid):
                 raise RecipientContractError("Unresolved or ambiguous Discord recipient; bind verified roster identity before delivery")
             if uid not in resolved:
                 resolved.append(uid)
@@ -57,7 +57,29 @@ def prepare_discord_message(text, extra, allowed, *, require_contract=False):
         body = text[match.end():]
         if not body.strip():
             raise RecipientContractError("Discord recipient contract requires a nonempty message")
+        # Only the header may notify. Preserve body references as inert text so
+        # repeated/chunked references cannot notify a second time.
+        for uid in resolved:
+            body = re.sub(r'<@!?' + re.escape(uid) + r'>', '@' + uid, body)
         # An explicit routing header avoids accidentally replacing narrative names,
         # and appears once on the first chunk, even when body contains code/URLs.
         return (" ".join(f"<@{uid}>" for uid in resolved) + "\n" if resolved else "") + body
     return rewrite_plain_mentions(text, extra.get("mention_roster_path"), actionable=enabled)
+
+
+def recipient_mention_policy(text, extra, allowed):
+    """Intersect effective permissions with declared intent; never widen suppression.
+
+    Return None for uncontracted/other-profile messages. The returned explicit
+    policy must travel with already-prepared chunks; do not infer intent from body.
+    """
+    if not (extra or {}).get("action_mentions") is True or not text.startswith(PREFIX):
+        return None
+    prepare_discord_message(text, extra, allowed)
+    match = _DECLARATION.match(text)
+    assert match is not None  # validated above
+    recipients = json.loads(match[1])
+    aliases = _load_alias_map(extra.get("mention_roster_path"))
+    ids = set(aliases.values())
+    resolved = list(dict.fromkeys(r if r in ids else aliases[r.casefold()] for r in recipients))
+    return {"parse": [], "users": resolved, "replied_user": False}

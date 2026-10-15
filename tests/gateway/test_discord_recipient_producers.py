@@ -45,7 +45,7 @@ async def test_persisted_background_subscription_actual_producer(adapter, monkey
     assert len(sends)>1
     assert sum(c.kwargs['content'].count(f'<@{JEFF}>') for c in sends)==1
     assert all('discord-recipients' not in c.kwargs['content'] for c in sends)
-    assert all('users' in c.kwargs['allowed_mentions'].to_dict()['parse'] for c in sends)
+    assert all(c.kwargs['allowed_mentions'].to_dict().get('users') == [int(JEFF)] for c in sends)
     assert body in sends[0].kwargs['content']
 
 @pytest.mark.asyncio

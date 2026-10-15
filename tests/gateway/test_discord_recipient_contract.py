@@ -33,7 +33,9 @@ async def test_producer_to_real_adapter_boundary(config, monkeypatch, body):
     assert body in calls[0].kwargs['content']
     for call in calls:
         policy = call.kwargs['allowed_mentions'].to_dict()
-        assert 'users' in policy['parse']
+        assert policy.get('users') == [int(JEFF)]
+        assert 'users' not in policy['parse']
+        assert policy.get('replied_user', False) is False
         assert not {'everyone','roles'}.intersection(policy['parse'])
 
 @pytest.mark.parametrize('declaration', ['[[discord-recipients:["Unknown"]]]\n', '[[discord-recipients:["1555599898265522328"]]]\n', '[[discord-recipients:broken]]\n'])

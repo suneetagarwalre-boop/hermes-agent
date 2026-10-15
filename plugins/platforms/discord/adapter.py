@@ -614,7 +614,7 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions(extra: Optional[dict] = None):
+def _build_allowed_mentions(extra: Optional[dict] = None, content: Optional[str] = None):
     """Build Discord ``AllowedMentions`` denying @everyone/@here/roles by default (any LLM output
     with ``@everyone`` would otherwise ping the server); user / replied-user pings stay on.
 
@@ -639,12 +639,28 @@ def _build_allowed_mentions(extra: Optional[dict] = None):
             return default
         return raw if isinstance(raw, bool) else str(raw).strip().lower() in {"true", "1", "yes", "on"}
 
-    return discord.AllowedMentions(
+    allowed = discord.AllowedMentions(
         everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", "everyone", False),
         roles=_b("DISCORD_ALLOW_MENTION_ROLES", "roles", False),
         users=_b("DISCORD_ALLOW_MENTION_USERS", "users", True),
         replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", "replied_user", True),
     )
+    # Internal call-local policy survives preparation/splitting without mutating
+    # shared profile config. It can only narrow the effective user permission.
+    policy = (extra or {}).get("_prepared_recipient_policy")
+    if content is not None:
+        from plugins.platforms.discord.recipient_contract import recipient_mention_policy
+        policy = recipient_mention_policy(content, extra, allowed) or policy
+    if policy is not None:
+        permitted = allowed.to_dict()
+        ids = [str(uid) for uid in policy.get("users", [])]
+        if any("users" not in permitted.get("parse", []) and uid not in
+               [str(x) for x in permitted.get("users", [])] for uid in ids):
+            from plugins.platforms.discord.recipient_contract import RecipientContractError
+            raise RecipientContractError("Discord recipient notification suppressed by effective allowed_mentions")
+        return discord.AllowedMentions(everyone=False, roles=False,
+            users=[discord.Object(id=int(uid)) for uid in ids], replied_user=False)
+    return allowed
 
 
 def _discord_ready_timeout_seconds() -> float:
@@ -3168,7 +3184,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             )
             message_ids = []
-            mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra)}
+            mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra, content)}
                               if self.config.extra.get("action_mentions") is True else {})
             reference = self._reply_reference_for_send(reply_to, channel)
             for i, chunk in enumerate(chunks):
@@ -3240,7 +3256,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a forum thread post with the message as starter (forum channels reject direct
         sends; name from the first line). Chunk failures land in ``raw_response['warnings']``."""
-        mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra)}
+        mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra, content)}
                           if self.config.extra.get("action_mentions") is True else {})
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
@@ -3256,7 +3272,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                msg = await thread_channel.send(content=chunk, **mention_kwargs)
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
@@ -7167,10 +7183,10 @@ async def _standalone_send(
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
     mention_extra = getattr(pconfig, "extra", None) or {}
-    allowed = _build_allowed_mentions(mention_extra)
-    allowed_payload = allowed.to_dict() if allowed is not None else {"parse": ["users"], "replied_user": False}
     from plugins.platforms.discord.recipient_contract import prepare_discord_message
     try:
+        allowed = _build_allowed_mentions(mention_extra, caption or message)
+        allowed_payload = allowed.to_dict() if allowed is not None else {"parse": ["users"], "replied_user": False}
         message = prepare_discord_message(message, mention_extra, allowed_payload)
         if caption:
             caption = prepare_discord_message(caption, mention_extra, allowed_payload)

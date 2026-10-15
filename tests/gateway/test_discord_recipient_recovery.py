@@ -39,7 +39,7 @@ async def test_actual_recovery_preserves_contract_marker_and_identity(adapter, m
     sent = channel.send.await_args.kwargs
     if valid:
         assert sent['content'] == 'Recovered: <@'+JEFF+'>\nThe report is ready for Jeff.'
-        assert 'users' in sent['allowed_mentions'].to_dict()['parse']
+        assert sent['allowed_mentions'].to_dict().get('users') == [int(JEFF)]
     else:
         assert 'delivery blocked' in sent['content']
         assert sent['allowed_mentions'].to_dict()['parse']==[]
