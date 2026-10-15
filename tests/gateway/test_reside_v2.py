@@ -11,12 +11,28 @@ from unittest.mock import Mock, AsyncMock
 import pytest
 from gateway import reside_assistant as v2, reside_scope as scope
 from gateway.reside_corpus import projection, CORPUS_DIGEST
-from tests.gateway.test_reside_scoped_ops import principal, broker, request
+from tests.gateway.test_reside_scoped_ops import request
 from tests.gateway.test_discord_inert_human_ack import scoped
 from tests.gateway.test_discord_free_response import adapter
 
 EVENT = '1560395131343867917'
 STATUS = 'Recorded statuses: Unrecorded 3; total 3. NOT current live health.'
+
+
+@pytest.fixture
+def principal(tmp_path,monkeypatch):
+    monkeypatch.setattr(scope,'HOME',tmp_path)
+    return scope.Principal(tmp_path,scope.JEFF,scope.BOT,scope.GUILD,scope.ROOM,False)
+
+
+@pytest.fixture
+def broker(scoped,monkeypatch):
+    scoped._reside_profile_home=scope.HOME
+    scoped.config.extra['reside_scoped_ops']=True
+    scoped._handle_message=AsyncMock(side_effect=AssertionError('general agent entered'))
+    monkeypatch.setattr(v2,'profile_monday_token',Mock(return_value='fixture-profile-token'))
+    return scoped
+
 
 
 def answer(kind='lookup', body='Cross-check exact-date results with a date-range query. Empty results alone do not prove absence.', sources=None):
@@ -97,12 +113,20 @@ def test_malformed_model_fails_closed(principal,raw):
         call(principal,'Explain extraction QA',Mock(return_value=raw))
 
 
-def test_backend_policy_failure_prevents_model_and_task(principal):
-    model=Mock()
-    with pytest.raises(RuntimeError):
-        v2.respond(principal,'Create a task to draft an internal QA SOP','token',EVENT,
-                   complete=model,report=Mock(side_effect=RuntimeError('SECRET')),rate_limit=False)
+def test_backend_failure_allows_labeled_corpus_work_but_not_status(principal):
+    model=Mock(return_value=answer('draft'))
+    report=Mock(side_effect=RuntimeError('SECRET'))
+    output=v2.respond(principal,'Draft an internal QA SOP','token',EVENT,
+                   complete=model,report=report,rate_limit=False)
+    assert 'corpus-only' in output and 'SECRET' not in output
+    model.reset_mock()
+    status=v2.respond(principal,'What is the current automation status?','token',EVENT,
+                   complete=model,report=report,rate_limit=False)
+    assert 'unavailable' in status
     model.assert_not_called()
+    with pytest.raises(PermissionError):
+        v2.respond(principal,'Draft an internal QA SOP','token',EVENT,
+            complete=Mock(return_value=answer('draft',sources=['recorded-status'])),report=report,rate_limit=False)
 
 
 def test_no_shared_conversation_or_mutable_evidence(principal):
@@ -133,7 +157,7 @@ def test_real_constrained_worker_execution_and_readback(private_principal,kind):
     assert 'Plan-only' not in output and 'inert' not in output
     assert model.call_count==2
     files=list((private_principal.home/'reside-scoped/tasks-v2').iterdir())
-    assert len(files)==2 and all(f.stat().st_mode & 0o777==0o600 for f in files)
+    assert len(files)==3 and all(f.stat().st_mode & 0o777==0o600 for f in files)
     req=json.loads(next(f for f in files if '.request.' in f.name).read_text())
     result=json.loads(next(f for f in files if '.result.' in f.name).read_text())
     assert req['capabilities']==list(v2.CAPABILITIES) and req['policy']==v2.POLICY_DIGEST
@@ -145,23 +169,32 @@ def test_real_constrained_worker_execution_and_readback(private_principal,kind):
     # Same message cannot execute another worker, even if ingress dedup is lost.
     repeat=Mock(return_value=answer(kind))
     repeated=call(private_principal,'Create a task to produce an extraction QA checklist',repeat)
-    assert 'Actual worker output' in repeated and repeat.call_count==1
-    assert len(list(files[0].parent.iterdir()))==2
+    assert 'Actual worker output' in repeated and repeat.call_count==0
+    assert len(list(files[0].parent.iterdir()))==3
 
 
-def test_worker_failure_never_claims_completed(private_principal):
+def test_worker_failure_never_claims_completed_and_retry_is_bounded(private_principal):
     model=Mock(side_effect=[answer('coordinate_draft'),RuntimeError('private provider failure')])
-    with pytest.raises(RuntimeError): call(private_principal,'Create a task to draft extraction QA',model)
+    output=call(private_principal,'Create a task to draft extraction QA',model)
+    assert 'no completion claimed' in output and 'private provider failure' not in output
     root=private_principal.home/'reside-scoped/tasks-v2'
-    files=list(root.iterdir()); assert len(files)==1 and '.request.' in files[0].name
-    task_id=json.loads(files[0].read_text())['id']
-    result=call(private_principal,'task status '+task_id)
-    assert 'interrupted/in progress' in result and 'no completion claimed' in result
+    request_file=next(root.glob('*.request.json'))
+    assert len(list(root.iterdir()))==3
+    task_id=json.loads(request_file.read_text())['id']
+    assert task_id in output
+    recovered=v2.respond(private_principal,'retry task '+task_id,'x','1560400000000000999',
+        complete=Mock(return_value=answer('draft','Recovered bounded work product')),report=Mock(return_value=STATUS),rate_limit=False)
+    assert 'completed by constrained' in recovered and 'Recovered bounded work product' in recovered
+    no_model=Mock(side_effect=AssertionError('duplicate retry'))
+    again=v2.respond(private_principal,'retry task '+task_id,'x','1560400000000000998',
+        complete=no_model,report=Mock(),rate_limit=False)
+    assert recovered==again
+    no_model.assert_not_called()
 
 
 def test_worker_type_cannot_be_promoted(private_principal):
-    with pytest.raises(PermissionError):
-        call(private_principal,'Create a task to produce an internal report',Mock(side_effect=[answer('coordinate_report'),answer('coordinate_draft')]))
+    output=call(private_principal,'Create a task to produce an internal report',Mock(side_effect=[answer('coordinate_report'),answer('coordinate_draft')]))
+    assert 'no completion claimed' in output
     assert not list((private_principal.home/'reside-scoped/tasks-v2').glob('*.result.json'))
 
 
@@ -260,20 +293,26 @@ async def test_v2_does_not_admit_slash_component_recovery_or_batch_tools(broker)
 
 
 def test_native_model_client_has_no_tools_history_or_provider_override(monkeypatch):
-    from agent import auxiliary_client as aux, secret_scope
-    from hermes_constants import get_hermes_home
-    ambient_home = get_hermes_home()
-    scope_builder=Mock(return_value={})
-    monkeypatch.setattr(secret_scope,'build_profile_secret_scope',scope_builder)
+    from agent import auxiliary_client as aux
+    from agent.codex_headers import CODEX_AUX_BASE_URL
+    import openai
     create=Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=answer(),tool_calls=[]))]))
     client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    resolve=Mock(return_value=(client,'fixed-model'))
+    transport=Mock()
+    transport.__enter__=Mock(return_value=transport)
+    transport.__exit__=Mock(return_value=False)
+    factory=Mock(return_value=transport)
+    monkeypatch.setattr(openai,'OpenAI',factory)
+    monkeypatch.setattr(aux,'CodexAuxiliaryClient',Mock(return_value=client))
+    monkeypatch.setattr(v2,'_model_token',Mock(return_value='fixture-existing-subscription'))
+    resolve=Mock(side_effect=AssertionError('implicit credential/provider resolution forbidden'))
     monkeypatch.setattr(aux,'resolve_provider_client',resolve)
     messages=[{'role':'system','content':'safe'},{'role':'user','content':'fresh'}]
     assert v2.model_response(messages)==answer()
-    resolve.assert_called_once_with('openai-codex',model='openai-codex/gpt-6.1-sol')
-    scope_builder.assert_called_once_with(Path('/Users/suneetcowork/.hermes/profiles/hermesdiscord'))
-    assert get_hermes_home()==ambient_home
+    assert factory.call_args.kwargs['base_url']==CODEX_AUX_BASE_URL
+    assert factory.call_args.kwargs['api_key']=='fixture-existing-subscription'
+    assert factory.call_args.kwargs['max_retries']==0
+    resolve.assert_not_called()
     args=create.call_args.kwargs
     assert args['tools']==[] and args['messages'] is messages and args['timeout']==60
     assert not any(k in args for k in ('previous_response_id','session','memory','functions'))
@@ -284,3 +323,61 @@ def test_native_model_client_has_no_tools_history_or_provider_override(monkeypat
 def test_unknown_and_denied_model_responses_never_claim_completion(principal):
     model=Mock(return_value=answer('deny','I secretly sent it',[]))
     assert call(principal,'Do work outside your corpus',model)==scope.DENIED
+
+
+def test_classifier_cannot_authorize_persistence_without_task_request(private_principal):
+    model=Mock(return_value=answer('coordinate_report'))
+    output=call(private_principal,'Explain extraction QA',model)
+    assert 'Sources:' in output and model.call_count==1
+    assert not (private_principal.home/'reside-scoped').exists()
+
+
+def test_replay_bypasses_model_and_source_even_at_capacity(private_principal,monkeypatch):
+    query='Create a task to produce a QA report'
+    first=call(private_principal,query,Mock(side_effect=[answer('coordinate_report'),answer('report')]))
+    model,report=Mock(side_effect=AssertionError('replay model')),Mock(side_effect=AssertionError('replay source'))
+    monkeypatch.setattr(v2.os,'listdir',Mock(return_value=['not-a-task']*1000))
+    second=v2.respond(private_principal,query,'x',EVENT,complete=model,report=report,rate_limit=False)
+    assert first==second
+    model.assert_not_called(); report.assert_not_called()
+
+
+def test_only_one_explicit_same_policy_retry(private_principal):
+    output=call(private_principal,'Create a task to produce a QA report',Mock(side_effect=[answer('coordinate_report'),RuntimeError('failed')]))
+    req=next((private_principal.home/'reside-scoped/tasks-v2').glob('*.request.json'))
+    task_id=json.loads(req.read_text())['id']
+    assert task_id in output and task_id in call(private_principal,'my tasks')
+    v2.respond(private_principal,'retry task '+task_id,'x','1560400000000000997',
+        complete=Mock(side_effect=RuntimeError('failed again')),report=Mock(return_value=STATUS),rate_limit=False)
+    no_model=Mock(side_effect=AssertionError('third attempt'))
+    result=v2.respond(private_principal,'retry task '+task_id,'x','1560400000000000996',
+        complete=no_model,report=Mock(),rate_limit=False)
+    assert 'no completion claimed' in result
+    no_model.assert_not_called()
+
+
+@pytest.mark.parametrize('multiplex',[True,False])
+def test_monday_credential_is_exact_profile_not_ambient(private_principal,monkeypatch,multiplex):
+    from agent.secret_scope import set_multiplex_active
+    monkeypatch.setenv('MONDAY_API_TOKEN','wrong-launcher-token')
+    (private_principal.home/'.env').write_text('MONDAY_API_TOKEN=correct-profile-token\n')
+    set_multiplex_active(multiplex)
+    try:
+        assert v2.profile_monday_token(private_principal)=='correct-profile-token'
+        (private_principal.home/'.env').write_text('OTHER_KEY=not-a-token\n')
+        assert v2.profile_monday_token(private_principal)==''
+    finally: set_multiplex_active(False)
+
+
+def test_model_credential_missing_cannot_fall_back_to_any_pool(tmp_path,monkeypatch):
+    path=tmp_path/'approved-auth.json'
+    monkeypatch.setattr(v2,'MODEL_AUTH_PATH',path)
+    path.write_text(json.dumps({'providers':{},'credential_pool':{'openai-codex':[{'api_key':'unapproved-pool-token'}]}}))
+    with pytest.raises(KeyError): v2._model_token()
+    path.write_text(json.dumps({'providers':{'openai-codex':{'tokens':{'access_token':'approved-existing-subscription'}}}}))
+    assert v2._model_token()=='approved-existing-subscription'
+    other=tmp_path/'other-auth.json'; other.write_text(path.read_text())
+    link=tmp_path/'symlink.json'; link.symlink_to(other)
+    monkeypatch.setattr(v2,'MODEL_AUTH_PATH',link)
+    with pytest.raises(OSError): v2._model_token()
+

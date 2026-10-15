@@ -1598,7 +1598,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 raise PermissionError("destination mismatch")
             if operation == "assistant":
                 from gateway import reside_assistant
-                token = _scoped_gate_env("MONDAY_API_TOKEN", "")
+                token = reside_assistant.profile_monday_token(principal)
                 try:
                     result = await asyncio.to_thread(reside_assistant.respond, principal,
                         payload['text'], token, str(message.id))

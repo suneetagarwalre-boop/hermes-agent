@@ -14,11 +14,13 @@ import threading
 import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid5
+from pathlib import Path
 
 from gateway import reside_scope as scope
 from gateway.reside_corpus import CORPUS_DATE, CORPUS_DIGEST, projection
 
-POLICY = 'reside-ops-v2.1'
+POLICY = 'reside-ops-v2.2'
+MODEL_AUTH_PATH = Path('/Users/suneetcowork/.hermes/auth.json')
 CAPABILITIES = ('projected_operations_read', 'internal_analysis', 'internal_draft')
 POLICY_DIGEST = hashlib.sha256(json.dumps([POLICY, CORPUS_DIGEST, CAPABILITIES,
     sorted(scope.RESOURCES.items()), scope.JEFF, scope.BOT, scope.GUILD, scope.ROOM]).encode()).hexdigest()
@@ -30,7 +32,7 @@ HELP = ('Reside operations assistant — private output only. Ask naturally, for
         'Create a task to produce an evidence-backed extraction QA checklist.\n'
         'Tasks run in the constrained Reside analyst/drafting executor, not a general agent. '
         'I return a completed work product and task ID, not an inert proposal. '
-        'Task status <UUID> retrieves your scoped result.\n'
+        'Task status <UUID> retrieves your scoped result; retry task <UUID> permits one same-policy retry; my tasks lists up to 10 private task IDs.\n'
         'Sources: 10 reviewed operating-rule projections (2026-10-15); live recorded statuses '
         'for three approved automations. No underlying clients, recaps, contacts, personnel, '
         'finance, other businesses, tools/admin, sends, enrollments or production changes.')
@@ -83,26 +85,50 @@ def validate_text(text):
     return text.strip()
 
 
-def model_response(messages):
-    """Fixed existing subscription route, no fallback/provider choice from text.
+def _model_token():
+    """Explicit existing shared Codex subscription, not implicit profile/pool fallback.
 
-    Low-level client only; no AIAgent prompt assembly/session/memory/plugin/tool
-    dispatch. store=False is enforced by the native Codex completion adapter.
+    Discovery verified hermesdiscord currently inherits this provider state. Pin
+    that exact authority and official endpoint; never select other pools/accounts.
+    Operator-managed refresh may replace tokens here; absence/errors fail closed.
     """
-    from agent.auxiliary_client import resolve_provider_client, aux_stream_deadline
-    from agent.secret_scope import build_profile_secret_scope, set_secret_scope, reset_secret_scope
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    # Bind model authentication/config independently of ambient multiplex/worker
-    # contexts. Neither requester text nor a caller's active profile can select it.
-    from pathlib import Path
-    model_home = Path('/Users/suneetcowork/.hermes/profiles/hermesdiscord')
-    home_token = set_hermes_home_override(model_home)
-    secret_token = None
+    fd = os.open(MODEL_AUTH_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        secret_token = set_secret_scope(build_profile_secret_scope(model_home), profile_home=str(model_home))
-        client, model = resolve_provider_client('openai-codex', model='openai-codex/gpt-6.1-sol')
-        if client is None or not model:
-            raise RuntimeError('scoped model unavailable')
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 1_000_000:
+            raise PermissionError('invalid approved model credential store')
+        raw = os.read(fd, 1_000_001)
+        if len(raw) > 1_000_000: raise ValueError('oversized credential store')
+        data = json.loads(raw, object_pairs_hook=scope._unique_json)
+        token = data['providers']['openai-codex']['tokens']['access_token']
+        if not isinstance(token, str) or not token.strip():
+            raise PermissionError('approved Codex credential absent')
+        return token
+    finally: os.close(fd)
+
+
+def profile_monday_token(principal):
+    principal.authorize()
+    from agent.secret_scope import load_env_file
+    # No process-environment, launcher, sibling or default-profile fallback.
+    return load_env_file(principal.home / '.env').get('MONDAY_API_TOKEN', '')
+
+
+def model_response(messages):
+    """Only the existing explicitly pinned Codex authority, official endpoint.
+
+    Low-level stateless completion adapter: no agent/config resolver, credential
+    pools, fallback providers, prompts, session state, memory, plugins or tools.
+    Native Codex adapter enforces store=False and provides bounded stream cleanup.
+    """
+    from agent.auxiliary_client import CodexAuxiliaryClient, aux_stream_deadline
+    from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
+    from openai import OpenAI
+    token = _model_token()
+    model = 'openai-codex/gpt-6.1-sol'
+    with OpenAI(api_key=token, base_url=CODEX_AUX_BASE_URL, timeout=60,
+            max_retries=0, default_headers=codex_cloudflare_headers(token, base_url=CODEX_AUX_BASE_URL)) as transport:
+        client = CodexAuxiliaryClient(transport, model)
         with aux_stream_deadline(time.monotonic() + 90):
             response = client.chat.completions.create(model=model, messages=messages,
                 tools=[], timeout=60, max_tokens=2400)
@@ -110,10 +136,6 @@ def model_response(messages):
         if getattr(message, 'tool_calls', None):
             raise PermissionError('model tool output denied')
         return message.content
-    finally:
-        if secret_token is not None:
-            reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
 
 
 def _parse(raw):
@@ -142,9 +164,15 @@ def _parse(raw):
 def evidence(principal, token, report=None):
     principal.authorize()
     # Server selects ALL safe sources. No user/model resource/query selection.
-    status = (report or scope.automation_report)(principal, token)
+    try:
+        status = (report or scope.automation_report)(principal, token)
+        available = True
+    except Exception:
+        # Static projected rules remain usable; never pass raw upstream errors.
+        status = 'UNAVAILABLE: no current recorded-status evidence; do not cite recorded-status or infer live findings.'
+        available = False
     return {'rules_snapshot': CORPUS_DATE, 'corpus_digest': CORPUS_DIGEST,
-            'operations': projection(), 'recorded-status': status}
+            'operations': projection(), 'recorded-status': status, 'status_available': available}
 
 
 def _render(answer):
@@ -220,69 +248,134 @@ def _envelope(principal, event_id, kind, question):
             'executor': kind, 'question': question}
 
 
-def _task_result(principal, task_id):
-    principal.authorize()
+def _load_task(principal, fd, task_id):
     if not isinstance(task_id, str) or str(UUID(task_id)) != task_id:
         raise ValueError('invalid scoped task ID')
+    stored = _read(fd, task_id + '.request.json')
+    expected = _envelope(principal, stored['event'], stored['executor'], stored['question'])
+    if stored != expected or stored['id'] != task_id:
+        raise PermissionError('task policy mismatch')
+    return stored
+
+
+def _task_result(principal, task_id):
+    principal.authorize()
     fd = _folder(principal)
     try:
-        stored = _read(fd, task_id + '.request.json')
-        # Never let persisted text mint/expand authority after restart.
-        expected = _envelope(principal, stored['event'], stored['executor'], stored['question'])
-        if stored != expected or stored['id'] != task_id:
-            raise PermissionError('task policy mismatch')
+        _load_task(principal, fd, task_id)
         try: result = _read(fd, task_id + '.result.json')
         except FileNotFoundError:
-            return f'Scoped task {task_id}: interrupted/in progress; no completion claimed. Ask Suneet if it remains interrupted; it is not redispatched with broader authority.'
+            return f'Scoped task {task_id}: failed/interrupted/in progress; no completion claimed. Use task status {task_id} to check, or retry task {task_id} for one bounded same-policy retry. No broader worker is dispatched.'
         if (not isinstance(result, dict) or set(result) != {'id','policy','completed','result'}
                 or result['id'] != task_id or result['policy'] != POLICY_DIGEST
                 or not isinstance(result['result'], str) or len(result['result']) > 9000):
             raise PermissionError('invalid completion evidence')
-        return f"Scoped internal task {task_id}: completed by constrained Reside executor at {result['completed']}.\n" + result['result']
+        return f"Scoped internal task {task_id}: completed by constrained Reside executor (work product, not approval) at {result['completed']}.\n" + result['result']
     finally: os.close(fd)
 
 
-def coordinate(principal, event_id, question, answer, token, *, complete=None, report=None):
-    """Dispatch only to the fixed report/draft executor, and verify its work product.
+def _execute_task(principal, task_id, token, *, complete=None, report=None, retry=False):
+    """Authoritative fixed worker, including recovery; never a generic consumer."""
+    fd = _folder(principal)
+    try:
+        stored = _load_task(principal, fd, task_id)
+        try:
+            _read(fd, task_id + '.result.json')
+            return _task_result(principal, task_id)
+        except FileNotFoundError: pass
+        # One initial execution and one explicit retry. Exclusive attempt creation
+        # avoids racing two callers onto the same attempt. No automatic replay.
+        attempt = 2 if retry else 1
+        if retry:
+            try: _read(fd, task_id + '.attempt-1.json')
+            except FileNotFoundError: raise PermissionError('initial attempt absent')
+        claim = {'id':task_id, 'policy':POLICY_DIGEST, 'started':_now()}
+        try: _write_new(fd, task_id + f'.attempt-{attempt}.json', claim)
+        except FileExistsError: return _task_result(principal, task_id)
+        try:
+            worker_kind = 'draft' if stored['executor'] == 'coordinate_draft' else 'report'
+            facts = evidence(principal, token, report=report)
+            worker_messages = [{'role':'system', 'content':SYSTEM + '\nFixed executor: return kind ' + worker_kind + '; produce the complete internal work product now.'},
+                {'role':'user', 'content':json.dumps({'request':stored['question'], 'safe_evidence':facts})}]
+            work = _parse((complete or model_response)(worker_messages))
+            if work['kind'] != worker_kind:
+                raise PermissionError('worker exceeded fixed executor type')
+            if not facts['status_available'] and 'recorded-status' in work['sources']:
+                raise PermissionError('unavailable source cited')
+            output = _render(work)
+            if not facts['status_available']:
+                output += '\nLive status unavailable: corpus-only work product; no current operational findings.'
+            completed = {'id':task_id, 'policy':POLICY_DIGEST, 'completed':_now(),
+                'result':output + '\nExecution ceiling: this work product only; no humans assigned, notifications, source writes or production workflows executed. Content remains a generated working product requiring human review.'}
+            _write_new(fd, task_id + '.result.json', completed)
+            if _read(fd, task_id + '.result.json') != completed:
+                raise RuntimeError('completion readback failed')
+        except Exception:
+            # Durable failure provenance, no raw exception/provider/source text.
+            _write_new(fd, task_id + f'.failed-{attempt}.json',
+                {'id':task_id, 'policy':POLICY_DIGEST, 'failed':_now(), 'reason':'bounded_worker_failed'})
+    finally: os.close(fd)
+    return _task_result(principal, task_id)
 
-    There is deliberately no general Kanban consumer. A report/draft task is
-    completed here with useful artifact evidence; requests for other work deny.
-    Raw text cannot select an assignee, future trigger, external action or grants.
-    """
+
+TASK_INTENT = re.compile(r'\b(?:create|open|start|coordinate|queue|run)\s+(?:(?:a|an|the|internal|scoped|reside)\s+){0,3}(?:task|job)\b|\b(?:coordinate|task)\s*:', re.I)
+
+
+def coordinate(principal, event_id, question, answer, token, *, complete=None, report=None):
+    """Persist only explicit task requests, then invoke the constrained worker."""
+    if not TASK_INTENT.search(question):
+        raise PermissionError('explicit task request required')
     envelope = _envelope(principal, event_id, answer['kind'], question)
     task_id = envelope['id']
     fd = _folder(principal)
     try:
-        # Bounded append-only storage. Old completed tasks are not silently erased.
-        if len(os.listdir(fd)) >= 600:
+        try: existing = _read(fd, task_id + '.request.json')
+        except FileNotFoundError: existing = None
+        if existing is not None:
+            if existing != envelope: raise PermissionError('event identity conflict')
+            return _task_result(principal, task_id)
+        # Capacity applies only to NEW work, never lookup/replay/recovery.
+        if len(os.listdir(fd)) >= 1000:
             raise ValueError('scoped storage full; operator archive needed')
         try: _write_new(fd, task_id + '.request.json', envelope)
         except FileExistsError:
-            if _read(fd, task_id + '.request.json') != envelope:
+            if _load_task(principal, fd, task_id) != envelope:
                 raise PermissionError('event identity conflict')
             return _task_result(principal, task_id)
-        # Revalidate the complete immutable attenuation envelope at the worker
-        # transition; no prompt or text-supplied contract is an authorization gate.
-        stored = _read(fd, task_id + '.request.json')
-        if stored != envelope or stored['policy'] != POLICY_DIGEST:
-            raise PermissionError('task changed before execution')
-        # Actual constrained worker invocation: fresh evidence, fresh stateless
-        # model call, fixed work-product type. Never generic delegation/Kanban.
-        worker_kind = 'draft' if stored['executor'] == 'coordinate_draft' else 'report'
-        worker_messages = [{'role':'system', 'content':SYSTEM + '\nFixed executor: return kind ' + worker_kind + '; produce the complete internal work product now.'},
-            {'role':'user', 'content':json.dumps({'request':stored['question'],
-                'safe_evidence':evidence(principal, token, report=report)})}]
-        work = _parse((complete or model_response)(worker_messages))
-        if work['kind'] != worker_kind:
-            raise PermissionError('worker exceeded fixed executor type')
-        output = _render(work)
-        completed = {'id': task_id, 'policy': POLICY_DIGEST, 'completed': _now(),
-                     'result': output + '\nExecution ceiling: this work product only; no humans assigned, notifications, source writes or production workflows executed.'}
-        _write_new(fd, task_id + '.result.json', completed)
-        if _read(fd, task_id + '.result.json') != completed:
-            raise RuntimeError('completion readback failed')
     finally: os.close(fd)
-    return _task_result(principal, task_id)
+    return _execute_task(principal, task_id, token, complete=complete, report=report)
+
+
+def _existing_event(principal, text, event_id):
+    if not isinstance(event_id,str) or not re.fullmatch(r'[0-9]{15,22}',event_id):
+        return None
+    # Avoid creating storage on ordinary reads. Root is trusted, but task files
+    # are opened by the no-follow descriptor reader before being trusted.
+    folder = principal.home / 'reside-scoped' / 'tasks-v2'
+    if not folder.exists(): return None
+    task_id = str(uuid5(NAMESPACE,principal.user + ':' + event_id))
+    fd = _folder(principal)
+    try:
+        try: stored = _load_task(principal,fd,task_id)
+        except FileNotFoundError: return None
+        if stored['question'] != text: raise PermissionError('event identity conflict')
+    finally: os.close(fd)
+    return _task_result(principal,task_id)
+
+
+def _list_tasks(principal):
+    fd = _folder(principal)
+    try:
+        names = sorted(name for name in os.listdir(fd) if name.endswith('.request.json'))
+        lines = []
+        for name in names[:1000]:
+            task_id = name.removesuffix('.request.json')
+            try: stored = _load_task(principal,fd,task_id)
+            except (PermissionError,ValueError,KeyError): continue
+            lines.append(task_id + ' — ' + stored['executor'])
+            if len(lines) == 10: break
+        return 'Your scoped task IDs (up to 10; status/retry use these IDs):\n' + ('\n'.join(lines) if lines else 'No tasks under the current policy.')
+    finally: os.close(fd)
 
 
 def respond(principal, text, token, event_id, *, complete=None, report=None, rate_limit=True):
@@ -293,22 +386,37 @@ def respond(principal, text, token, event_id, *, complete=None, report=None, rat
     if text.lower() in ('reside', 'reside help', 'help', 'what can you do?'):
         return HELP
     status_match = re.fullmatch(r'(?:reside\s+)?task\s+status\s+([0-9a-f-]{36})', text, re.I)
-    if status_match:
-        return _task_result(principal, status_match.group(1))
-    if FORBIDDEN.search(text):
-        return scope.DENIED
+    if status_match: return _task_result(principal,status_match.group(1))
+    if text.lower() in ('my tasks','list my tasks','reside tasks'): return _list_tasks(principal)
+    if FORBIDDEN.search(text): return scope.DENIED
+    existing = _existing_event(principal,text,event_id)
+    if existing is not None: return existing
     if not _LOCK.acquire(blocking=False):
         return 'Scoped Reside analyst is busy. No new work started; try again shortly.'
     try:
         if rate_limit and time.monotonic() - _LAST < 3:
             return 'Scoped Reside request limit: no new work started; try again shortly.'
         _LAST = time.monotonic()
+        retry_match = re.fullmatch(r'retry\s+task\s+([0-9a-f-]{36})',text,re.I)
+        if retry_match:
+            return _execute_task(principal,retry_match.group(1),token,complete=complete,report=report,retry=True)
         facts = evidence(principal, token, report=report)
+        if not facts['status_available'] and re.search(r'\b(status|health|running|failures|errors)\b',text,re.I):
+            return 'Current recorded automation status is unavailable. No live status findings can be verified; documented-rule lookups and internal drafts remain available.'
         messages = [{'role':'system','content':SYSTEM},
                     {'role':'user','content':json.dumps({'request':text,'safe_evidence':facts})}]
         answer = _parse((complete or model_response)(messages))
         if answer['kind'] == 'deny': return scope.DENIED
+        if not facts['status_available'] and 'recorded-status' in answer['sources']:
+            raise PermissionError('unavailable source cited')
         if answer['kind'].startswith('coordinate_'):
-            return coordinate(principal, event_id, text, answer, token, complete=complete, report=report)
-        return _render(answer)
+            if TASK_INTENT.search(text):
+                return coordinate(principal,event_id,text,answer,token,complete=complete,report=report)
+            # Classifier mistakes cannot authorize persistence or another call.
+            answer['kind'] = 'draft' if answer['kind'].endswith('draft') else 'report'
+        output = _render(answer)
+        if not facts['status_available']:
+            output += '\nLive status unavailable: corpus-only answer; no current operational findings.'
+        return output
     finally: _LOCK.release()
+
