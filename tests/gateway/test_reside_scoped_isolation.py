@@ -68,7 +68,9 @@ def test_pagination_limit_does_not_claim_total(principal):
     def post(q,v,t):
         calls.append(v)
         if not v: return first
-        return {'next_items_page':{'cursor':str(len(calls)), 'items':[row()]}}
+        # Continue empty pages so the traversal ceiling (not duplicate-ID
+        # protection) is the exercised failure boundary.
+        return {'next_items_page':{'cursor':str(len(calls)), 'items':[]}}
     with pytest.raises(ValueError,match='incomplete'):
         scope.automation_report(principal,'x',post)
 

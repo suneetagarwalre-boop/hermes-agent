@@ -24,9 +24,27 @@ WORKSPACE = '5302393'
 AGENT = 'dropdown_mm3cxfke'
 STATUS = 'color_mm856pmn'
 LABELS = {0: 'Partial', 1: 'OK', 2: 'Error', 3: 'Skipped', None: 'Unrecorded'}
+# Reviewed resource grants, verified by independent item descriptions and exact
+# board/group membership. Agent assignment and board branding confer no grant.
+# See docs/jeff-reside-scoped-ops.md for discovery evidence and exclusions.
+RESOURCES = {
+    '11790940111': 'reside-action-item-extractor',
+    '11997188711': 'reside-meeting-attendance-mini',
+    '11997844820': 'reside-agent-training-attendance-mini',
+}
+APPROVED_STATUS_LABELS = {str(k): v for k, v in LABELS.items() if k is not None}
+
+
+def _unique_json(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON field')
+        result[key] = value
+    return result
 DENIED = 'Not available in your scoped Reside lane. Ask Suneet for anything outside the supported operations; nothing was executed.'
 HELP = ('Scoped Reside operations (private replies only):\n'
-        'reside report — current automation run-status counts for Dave-owned scheduled Reside automations.\n'
+        'reside report — recorded run-status counts for three pinned Reside operational automations.\n'
         'reside lookup automation-health — same bounded operational lookup.\n'
         'reside draft {"objective":"...","context":"..."} — internal SOP working draft from only your supplied facts.\n'
         'reside coordinate {"title":"...","details":"..."} — inert proposal receipt, NOT worker dispatch or approval.\n'
@@ -101,13 +119,13 @@ def _post(query: str, variables: dict, token: str) -> dict:
     return data['data']
 
 
-# No names, contacts, task IDs, descriptions, schedules, URLs, free-text statuses,
-# personnel or financial fields are requested. Cross-business/co-owned rows are
-# excluded before aggregation. Queries and resource IDs are not user inputs.
-FIELDS = ('column_values(ids:["dropdown_mm3cxfke","color_mm856pmn"]) '
-          '{id ... on DropdownValue {values {id label}} ... on StatusValue {index}}')
-FIRST = ('{boards(ids:[18406413029]){id workspace_id columns{id title type} '
-         'groups(ids:["topics"]){id items_page(limit:500){cursor items{' + FIELDS + '}}}}}')
+# Only immutable IDs, identity-drift sentinels and recorded statuses are read.
+# Names are validated internally, never rendered. Unknown IDs are not grants.
+FIELDS = ('id name column_values(ids:["color_mm856pmn"]) '
+          '{id ... on StatusValue {index}}')
+FIRST = ('{boards(ids:[18406413029]){id workspace_id columns{id title type settings_str} '
+         'groups(ids:["topics"]){id items_page(limit:500,query_params:{ids:['
+         + ','.join(RESOURCES) + ']}){cursor items{' + FIELDS + '}}}}}')
 NEXT = ('query($cursor:String!){next_items_page(limit:500,cursor:$cursor){cursor items{' + FIELDS + '}}}')
 
 
@@ -120,24 +138,37 @@ def automation_report(principal: Principal, token: str, post=_post) -> str:
     board = boards[0]
     if board['id'] != BOARD or str(board['workspace_id']) != WORKSPACE:
         raise PermissionError('resource mismatch')
-    schema = {c['id']: (c['title'], c['type']) for c in board['columns']}
-    if schema.get(AGENT) != ('Agent', 'dropdown') or schema.get(STATUS) != ('Last Status', 'status'):
+    schema = {c['id']: c for c in board['columns']}
+    if len(schema) != len(board['columns']):
+        raise ValueError('duplicate column')
+    status = schema.get(STATUS, {})
+    if (status.get('title'), status.get('type')) != ('Last Status', 'status'):
         raise ValueError('schema drift')
+    settings = json.loads(status['settings_str'], object_pairs_hook=_unique_json)
+    if not isinstance(settings, dict) or settings.get('labels') != APPROVED_STATUS_LABELS:
+        raise ValueError('status label drift')
     if len(board['groups']) != 1 or board['groups'][0]['id'] != 'topics':
         raise ValueError('group mismatch')
     page = board['groups'][0]['items_page']
     counts = {label: 0 for label in LABELS.values()}
     cursors = set()
+    seen = set()
     for _ in range(20):
         items = page['items']
         if not isinstance(items, list) or len(items) > 500:
             raise ValueError('invalid page')
         for item in items:
-            cols = {c['id']: c for c in item['column_values']}
-            values = cols[AGENT]['values']
-            # Exact single assignment. Even dave+martin rows are out of scope.
-            if values != [{'id': '1', 'label': 'dave'}]:
+            item_id = item['id']
+            if not isinstance(item_id, str):
+                raise ValueError('invalid resource identity')
+            if item_id not in RESOURCES:
                 continue
+            if item_id in seen or item['name'] != RESOURCES[item_id]:
+                raise ValueError('resource identity drift')
+            seen.add(item_id)
+            cols = {c['id']: c for c in item['column_values']}
+            if len(cols) != len(item['column_values']):
+                raise ValueError('duplicate value')
             index = cols[STATUS]['index']
             if index is not None and type(index) is not int:
                 raise ValueError('invalid status')
@@ -153,9 +184,11 @@ def automation_report(principal: Principal, token: str, post=_post) -> str:
         page = post(NEXT, {'cursor': cursor}, token)['next_items_page']
     else:
         raise ValueError('incomplete report')
+    if seen != set(RESOURCES):
+        raise ValueError('approved resource missing; incomplete report')
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
     return ('Reside automation run-status report\nAs of ' + stamp + '\n'
-            'Scope: Scheduled Automations in Reside Automations Hub; sole agent Dave.\n'
+            'Scope: three pinned Reside operational automation IDs; not all Hub rows.\n'
             + '\n'.join(f'{k}: {v}' for k, v in counts.items())
             + f'\nTotal in scope: {sum(counts.values())}\n'
             'These are recorded Last Status values, not proof of current live service health. '

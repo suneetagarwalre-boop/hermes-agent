@@ -57,16 +57,35 @@ board metadata, not label inference alone. Reside Automations Hub is board
 `18406413029`, workspace `5302393` (RESIDE Workspace). It contains mixed-domain
 records, so a whole-board export is NOT authorized.
 
-The fixed backend query requests group `topics` (Scheduled Automations) and ONLY
-Agent dropdown (`dropdown_mm3cxfke`) plus Last Status (`color_mm856pmn`). It does
-not request names, record IDs, descriptions, schedules, free text, URLs, contacts,
-personnel, financial data or connected-board fields. Schema/workspace/group IDs
-are verified. Only sole assignment `[{id: "1", label: "dave"}]` contributes to the
-histogram; unassigned, other-agent and co-assigned records do not. No row or
-upstream label/text is returned. Fixed status indices map to Partial/OK/Error/
-Skipped/Unrecorded. Unknown status/schema errors fail closed. Blank is unrecorded,
-not failure; this is not runtime liveness certification. Paging is bounded, loop
-checked and complete or fails; no misleading partial total is returned.
+The report grants are three fixed item IDs, independently verified by exact live
+item descriptions and board/group membership (not Agent routing):
+
+- `11790940111`, `reside-action-item-extractor`: Reside coach-call recap action extraction.
+- `11997188711`, `reside-meeting-attendance-mini`: zoom-reside meeting attendance automation.
+- `11997844820`, `reside-agent-training-attendance-mini`: zoom-reside Agent Weekly attendance automation.
+
+Read-only discovery evidence is in the task workspace `verified-grants.json` and
+`verify_grants.py`. Only their automation run-status counts are granted, NOT the
+underlying transcripts, participants, client/staff information or action items.
+Financial/payroll, GHL/account administration, ambiguous client-health, shared
+fleet and BSHG/personal records are excluded even if assigned solely to Dave.
+New IDs, same-name clones and changed Agent assignments never auto-expand grants.
+
+The fixed backend query pins `query_params.ids` to exactly those three IDs inside
+group `topics` (Scheduled Automations), reading only their item ID/name
+(internal identity-drift sentinels) and Last Status
+(`color_mm856pmn`). Unknown IDs are discarded before status processing. Approved
+IDs must have their exact verified names; missing/renamed/duplicate approved IDs
+fail closed. Runtime does not retrieve descriptions, schedules, URLs, contacts,
+participants, personnel, financial data or connected-board fields. No row names,
+IDs or upstream free text are returned. Schema/workspace/group IDs are verified.
+Live Last Status `settings_str.labels` must exactly equal the approved mapping
+`0: Partial, 1: OK, 2: Error, 3: Skipped`; relabels, remaps, missing/additional
+labels, malformed settings and duplicate JSON keys fail closed. Blank is
+Unrecorded, not failure; this is not runtime liveness certification. Paging is
+bounded, loop checked and complete or fails; no partial total is returned.
+This is a narrower and independently verified set than the previous sole-Dave
+projection (which was rejected in review). It is not a full-Hub health report.
 
 Credential is the already-configured profile-scoped `MONDAY_API_TOKEN`. No new
 credential, scope, permission or secret-file edit is required. URL is fixed HTTPS
