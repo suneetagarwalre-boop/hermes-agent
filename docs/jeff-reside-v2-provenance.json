@@ -1,0 +1,48 @@
+{
+  "verified_at": "2026-10-15T21:27:42.162405+00:00",
+  "runtime_raw_document_access": false,
+  "snapshot": "2026-10-15",
+  "sources": [
+    {
+      "source": "extractor",
+      "operator_only_path": "/Users/suneetcowork/.hermes/runtime/Scheduled/reside-action-item-extractor/SKILL.md",
+      "sha256": "be6e8fa9c0c368a9f9cc6d09f2a1a5b784e3b60a64ac1cfa650d472280aa31d2",
+      "projection_line_ranges": {
+        "extraction-scope": "36-58,64-74",
+        "extraction-routing": "60-85",
+        "extraction-source-QA": "10-12,18-32,129-131",
+        "extraction-handoff": "109-135"
+      }
+    },
+    {
+      "source": "meeting",
+      "operator_only_path": "/Users/suneetcowork/.hermes/profiles/dave/skills/reside-zoom-client-matching/SKILL.md",
+      "sha256": "ff3eadf77a904fb1621c59280c36f1030cc673acf9b8d3d79efa418ea41012e2",
+      "projection_line_ranges": {
+        "meeting-classification": "140-164",
+        "matching-QA": "168-177,185-218"
+      }
+    },
+    {
+      "source": "cadence",
+      "operator_only_path": "/Users/suneetcowork/.hermes/profiles/dave/skills/reside-coaching-cadence-monitor/SKILL.md",
+      "sha256": "190f2687013e26349cc7e4e030d65e821dd697ab311a74717f7826a43e77f40f",
+      "projection_line_ranges": {
+        "cadence-evidence": "150-167,188-210,305-310",
+        "cadence-tiers": "212-229"
+      }
+    },
+    {
+      "source": "context",
+      "operator_only_path": "/Users/suneetcowork/.hermes/profiles/dave/skills/reside-context/SKILL.md",
+      "sha256": "f696aca7688678cbe900ac3ade9d99064d7738dcf0a6fa760386399237d209d5",
+      "projection_line_ranges": {
+        "context": "42-44,52-62",
+        "training": "80-87"
+      }
+    }
+  ],
+  "excluded": "Actual client/contact/participant/personnel/finance information, account mappings, historical performance, BSHG/personal material, execution commands and source secrets. Projected descriptions do not grant authority to run described workflows.",
+  "reviewed_projection": "gateway/reside_corpus.py",
+  "source_drift_policy": "Snapshot remains dated; no automatic broadening or raw runtime refresh. Operator reviews/reprojects via code review if rules change."
+}
