@@ -57,7 +57,7 @@ run production workflows, change statuses or schedule future work. Deny unsuppor
 For coordination produce the full useful deliverable now, not a proposal or empty receipt.
 Respond with exactly one JSON object, no Markdown fences, with fields:
 kind: lookup|report|draft|coordinate_report|coordinate_draft|deny;
-body: useful contextual answer/work product (up to 4300 characters);
+body: useful contextual answer/work product (target 2000-3000 characters; hard limit 6000);
 sources: nonempty array of exact projection IDs supporting the factual assertions.
 Separate documented facts, inference/recommendation, requester-supplied assumptions,
 and open decisions. Cite IDs inline where useful. Use specific operational checks,
@@ -90,16 +90,30 @@ def model_response(messages):
     dispatch. store=False is enforced by the native Codex completion adapter.
     """
     from agent.auxiliary_client import resolve_provider_client, aux_stream_deadline
-    client, model = resolve_provider_client('openai-codex', model='openai-codex/gpt-6.1-sol')
-    if client is None or not model:
-        raise RuntimeError('scoped model unavailable')
-    with aux_stream_deadline(time.monotonic() + 90):
-        response = client.chat.completions.create(model=model, messages=messages,
-            tools=[], timeout=60, max_tokens=2400)
-    message = response.choices[0].message
-    if getattr(message, 'tool_calls', None):
-        raise PermissionError('model tool output denied')
-    return message.content
+    from agent.secret_scope import build_profile_secret_scope, set_secret_scope, reset_secret_scope
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    # Bind model authentication/config independently of ambient multiplex/worker
+    # contexts. Neither requester text nor a caller's active profile can select it.
+    from pathlib import Path
+    model_home = Path('/Users/suneetcowork/.hermes/profiles/hermesdiscord')
+    home_token = set_hermes_home_override(model_home)
+    secret_token = None
+    try:
+        secret_token = set_secret_scope(build_profile_secret_scope(model_home), profile_home=str(model_home))
+        client, model = resolve_provider_client('openai-codex', model='openai-codex/gpt-6.1-sol')
+        if client is None or not model:
+            raise RuntimeError('scoped model unavailable')
+        with aux_stream_deadline(time.monotonic() + 90):
+            response = client.chat.completions.create(model=model, messages=messages,
+                tools=[], timeout=60, max_tokens=2400)
+        message = response.choices[0].message
+        if getattr(message, 'tool_calls', None):
+            raise PermissionError('model tool output denied')
+        return message.content
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
 
 
 def _parse(raw):
@@ -111,7 +125,7 @@ def _parse(raw):
     kind, body, sources = value['kind'], value['body'], value['sources']
     if not isinstance(kind, str) or kind not in KINDS:
         raise PermissionError('unknown executor')
-    if (not isinstance(body, str) or not body.strip() or len(body) > 4300
+    if (not isinstance(body, str) or not body.strip() or len(body) > 6000
             or re.search(r'https?://|<@|!\[|/Users/|MEDIA:', body, re.I)
             or any(ord(c) < 32 and c not in '\n\t' for c in body)):
         raise ValueError('invalid prose')
