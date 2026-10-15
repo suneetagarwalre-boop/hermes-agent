@@ -24,6 +24,16 @@ class _FakeAllowedMentions:
         self.users = users
         self.replied_user = replied_user
 
+    def to_dict(self):
+        payload = {"parse": [], "replied_user": self.replied_user}
+        for key in ("everyone", "roles", "users"):
+            value = getattr(self, key)
+            if value is True:
+                payload["parse"].append(key)
+            elif value is not False:
+                payload[key] = [x.id for x in value]
+        return payload
+
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return (
             f"AllowedMentions(everyone={self.everyone}, roles={self.roles}, "

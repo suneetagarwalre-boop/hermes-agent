@@ -1484,6 +1484,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 channel_ids=msg_channel_ids,
             ):
                 self._warn_if_fail_closed_default()
+                logger.info("[%s] Human message denied by authorization message=%s channel=%s; agent_dispatch=false",
+                            self.name, message_id, message.channel.id)
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
         raw_self_mention = self._self_is_explicitly_mentioned(message)
@@ -1528,11 +1530,54 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
+        was_duplicate = self._dedup.contains(str(getattr(message, "id", "")))
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
+            if not was_duplicate:
+                await self._ack_unprivileged_human(message)
             return False
         self._record_bot_tag_debounce(message)
         return await self._handle_message(message, role_authorized=role_authorized)
+
+    async def _ack_unprivileged_human(self, message: Any) -> None:
+        """Inert courtesy response, NOT authorization or agent dispatch.
+
+        Opt-in exact rooms only. No history, attachments, model, tools or instructions
+        are processed. Admission already claimed the ID, so duplicates cannot retry.
+        """
+        rooms = self.config.extra.get("unprivileged_ack_channels", [])
+        if not isinstance(rooms, list) or str(message.channel.id) not in {str(x) for x in rooms}:
+            return
+        author = message.author
+        guild = getattr(message, "guild", None)
+        if (guild is None or getattr(author, "bot", False) or author == self._client.user
+                or message.type not in {discord.MessageType.default, discord.MessageType.reply}
+                or not self._self_is_raw_mentioned(message)
+                or self._channel_response_addressed(message) is False):
+            return
+        keys = self._discord_channel_keys(message, None)
+        allowed, ignored = self._get_allowed_channels(), self._get_ignored_channels()
+        if (allowed and "*" not in allowed and not keys & allowed) or "*" in ignored or keys & ignored:
+            return
+        uid = str(author.id)
+        if not uid.isdigit() or self._is_allowed_user(uid, author, guild=guild, is_dm=False,
+                                                       channel_ids={str(message.channel.id)}):
+            return
+        # Fixed content only: never echo attacker text or promise to execute it.
+        text = (f"<@{uid}> I saw your message. I can acknowledge you here, but "
+                "private account access and actions require Suneet’s approval.")
+        content = str(getattr(message, "content", "")).casefold()
+        if "tag them" in content and "action" in content and "how will they know" in content:
+            text = (f"<@{uid}> Understood: when I ask someone here to act, I need to use "
+                    "their real Discord mention, not just their name. This acknowledgment grants no account access or action authority.")
+        try:
+            await message.channel.send(content=text, allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=[discord.Object(id=int(uid))], replied_user=False))
+            logger.info("[%s] Inert human acknowledgment delivered message=%s channel=%s; agent_dispatch=false",
+                        self.name, message.id, message.channel.id)
+        except Exception:
+            logger.warning("[%s] Inert human acknowledgment failed message=%s; no automatic retry",
+                           self.name, message.id, exc_info=True)
 
     # --- gateway_platform_event fire-sites ---
 
@@ -4354,7 +4399,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
         if not content:
             return content
-        return rewrite_plain_mentions(convert_table_to_bullets(content))
+        return rewrite_plain_mentions(
+            convert_table_to_bullets(content), self.config.extra.get("mention_roster_path"),
+            actionable=self.config.extra.get("action_mentions") is True)
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
@@ -7024,9 +7071,14 @@ async def _standalone_send(
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
-    message = rewrite_plain_mentions(message)
+    mention_extra = getattr(pconfig, "extra", None) or {}
+    mention_kwargs = {"roster_path": mention_extra.get("mention_roster_path"),
+                      "actionable": mention_extra.get("action_mentions") is True}
+    allowed = _build_allowed_mentions(mention_extra)
+    allowed_payload = allowed.to_dict() if allowed is not None else {"parse": ["users"], "replied_user": False}
+    message = rewrite_plain_mentions(message, **mention_kwargs)
     if caption:
-        caption = rewrite_plain_mentions(caption)
+        caption = rewrite_plain_mentions(caption, **mention_kwargs)
     try:
         import aiohttp
     except ImportError:
@@ -7068,7 +7120,7 @@ async def _standalone_send(
                             {"id": str(idx), "filename": os.path.basename(path)}
                             for idx, path in enumerate(valid_media)
                         ]
-                        starter_message = {"content": (caption or message), "attachments": attachments_meta}
+                        starter_message = {"content": (caption or message), "attachments": attachments_meta, "allowed_mentions": allowed_payload}
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
                         form = aiohttp.FormData()
                         form.add_field("payload_json", payload_json, content_type="application/json")
@@ -7089,7 +7141,7 @@ async def _standalone_send(
                         # No media: JSON POST creates the thread with the text starter.
                         async with session.post(
                             thread_url, headers=json_headers,
-                            json={"name": thread_name, "message": {"content": message}}, **_req_kw,
+                            json={"name": thread_name, "message": {"content": message, "allowed_mentions": allowed_payload}}, **_req_kw,
                         ) as resp:
                             data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
                             if err:
@@ -7106,7 +7158,7 @@ async def _standalone_send(
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                async with session.post(url, headers=json_headers, json={"content": message, "allowed_mentions": allowed_payload}, **_req_kw) as resp:
                     last_data, err = await _standalone_response_json_or_error(resp, "Discord API error")
                     if err:
                         return err
@@ -7119,7 +7171,7 @@ async def _standalone_send(
                     if caption_pending:
                         try:
                             async with session.post(
-                                url, headers=json_headers, json={"content": caption}, **_req_kw,
+                                url, headers=json_headers, json={"content": caption, "allowed_mentions": allowed_payload}, **_req_kw,
                             ) as resp:
                                 if resp.status in {200, 201}:
                                     last_data = await _standalone_read_json_limited(
@@ -7134,7 +7186,7 @@ async def _standalone_send(
                     filename = os.path.basename(media_path)
                     if caption_pending:
                         form.add_field(
-                            "payload_json", json.dumps({"content": caption}),
+                            "payload_json", json.dumps({"content": caption, "allowed_mentions": allowed_payload}),
                             content_type="application/json",
                         )
                         caption_pending = False
@@ -7320,6 +7372,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions"):
+        if key in discord_cfg:
+            seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:
         seeded_extra["channel_response_policy"] = discord_cfg["channel_response_policy"]
     for key, env_key in _YAML_BOOL_ENV_KEYS:

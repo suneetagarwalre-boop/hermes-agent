@@ -89,8 +89,9 @@ def test_adapter_real_send_path_rewrites_before_channel_send(
     )
 
 
+@pytest.mark.parametrize("actionable,users", [(False, True), (True, True), (True, False)])
 def test_standalone_send_message_path_rewrites_before_rest_post(
-    monkeypatch, roster
+    monkeypatch, roster, actionable, users
 ):
     class Content:
         def __init__(self):
@@ -136,11 +137,16 @@ def test_standalone_send_message_path_rewrites_before_rest_post(
     monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: Session())
     result = asyncio.run(
         _standalone_send(
-            SimpleNamespace(token="test-token"),
+            SimpleNamespace(token="test-token", extra={"mention_roster_path": str(roster),
+                            "action_mentions": actionable, "allow_mentions": {"users": users}}),
             "555",
-            "please ask @Letterman",
+            "Letterman, please test" if actionable else "please ask @Letterman",
         )
     )
 
     assert result["success"] is True
-    assert posted[0][1]["content"] == "please ask <@1511441029314908171>"
+    assert posted[0][1]["content"] == ("<@1511441029314908171>, please test" if actionable else "please ask <@1511441029314908171>")
+    mentions = posted[0][1]["allowed_mentions"]
+    assert ("users" in mentions["parse"]) is users
+    assert "everyone" not in mentions["parse"]
+    assert "roles" not in mentions["parse"]

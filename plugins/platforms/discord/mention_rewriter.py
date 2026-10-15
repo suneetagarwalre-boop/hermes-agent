@@ -95,22 +95,37 @@ def _rewrite_prose(text: str, aliases: Mapping[str, str]) -> str:
 def rewrite_plain_mentions(
     text: str,
     roster_path: str | os.PathLike[str] | None = None,
+    *, actionable: bool = False,
 ) -> str:
-    """Rewrite known ``@Name`` tokens outside code spans/fences and URLs."""
-    if not isinstance(text, str) or "@" not in text:
+    """Rewrite known ``@Name`` tokens; optionally explicit action vocatives.
+
+    Bare names are only rewritten at line start with a comma/colon and an
+    imperative/request or recipient-result marker. Narrative names stay inert.
+    """
+    if not isinstance(text, str):
         return text
     aliases = _load_alias_map(roster_path)
     if not aliases:
         return text
+    def prose(part: str) -> str:
+        if actionable:
+            names = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
+            request = re.compile(
+                rf"(?im)^([ \t]*(?:[-*] )?)({names})([,：:]\s*)(?=(?:please\b|can you\b|could you\b|"
+                rf"would you\b|I need you\b|your (?:result|report|file|draft)\b|"
+                rf"review\b|check\b|test\b|confirm\b|send\b|approve\b|take\b|pick up\b))")
+            part = request.sub(lambda m: m[1] + f"<@{aliases[m[2].casefold()]}>" + m[3], part)
+        return _rewrite_prose(part, aliases)
+
     output: list[str] = []
     cursor = 0
     length = len(text)
     while cursor < length:
         tick = text.find("`", cursor)
         if tick < 0:
-            output.append(_rewrite_prose(text[cursor:], aliases))
+            output.append(prose(text[cursor:]))
             break
-        output.append(_rewrite_prose(text[cursor:tick], aliases))
+        output.append(prose(text[cursor:tick]))
         run_end = tick
         while run_end < length and text[run_end] == "`":
             run_end += 1
