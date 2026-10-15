@@ -4146,7 +4146,8 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
+        delivery_metadata: Optional[dict] = None) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
@@ -4170,7 +4171,7 @@ class BasePlatformAdapter(ABC):
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
+                content=text_content, delivery_metadata=delivery_metadata,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
@@ -4194,6 +4195,8 @@ class BasePlatformAdapter(ABC):
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)
+            if delivery_adapter._send_retry_is_final(result):
+                return
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
@@ -4291,8 +4294,16 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
+        from gateway.delivery_ledger import compute_obligation_id
+        metadata = dict(metadata or {})
+        metadata.setdefault("delivery_id", compute_obligation_id(
+            session_key, str(getattr(event, "ledger_message_id", None) or event.message_id or ""), text_content))
+        metadata["notify"] = True
+        if reply_to:
+            metadata.setdefault("source_message_id", str(reply_to))
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            delivery_metadata=metadata)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(

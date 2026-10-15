@@ -440,11 +440,22 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             content = row["content"]
+            from gateway.delivery_ledger import get_delivery_metadata
+            metadata = await asyncio.to_thread(get_delivery_metadata, row["obligation_id"]) if row["platform"] == "discord" else {}
+            if row["platform"] == "discord":
+                metadata.update(notify=True, delivery_id=row["obligation_id"])
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
             if row.get("needs_marker"):
-                content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                if row["platform"] == "discord":
+                    metadata["recovery_marker"] = row.get("marker", RECOVERED_MARKER)
+                else:
+                    content = row.get("marker", RECOVERED_MARKER) + content
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                send_kwargs = {"chat_id": row["chat_id"], "content": content, "metadata": metadata or None}
+                if metadata.get("source_message_id"):
+                    send_kwargs["reply_to"] = metadata["source_message_id"]
+                result = await adapter.send(**send_kwargs)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None

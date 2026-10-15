@@ -1694,7 +1694,15 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        previous_ephemeral = getattr(agent, "ephemeral_system_prompt", None)
         try:
+            resolve_adapter = getattr(self._runner, "_delivery_adapter_for", None)
+            adapter = resolve_adapter(ctx.source) if callable(resolve_adapter) else None
+            transport_instructions = getattr(adapter, "final_transport_instructions", None)
+            if callable(transport_instructions):
+                instruction = transport_instructions()
+                if instruction:
+                    agent.ephemeral_system_prompt = ((previous_ephemeral or "") + "\n\n" + instruction).strip()
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
@@ -1723,6 +1731,7 @@ class TurnRunner:
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
+            agent.ephemeral_system_prompt = previous_ephemeral
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

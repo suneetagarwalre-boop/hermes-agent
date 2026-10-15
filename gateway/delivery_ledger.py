@@ -155,6 +155,8 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     never spends the LAST budgeted attempt. An unclassified outage can outlast any timer, and a row
     the timer abandoned would be lost for good; leaving one attempt keeps it recoverable by the boot
     sweep after a restart, which is a real recovery signal."""
+    if str(last_error or "").startswith("discord_recipient_contract_refused:"):
+        return None
     if is_flood_error(last_error):
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
@@ -206,6 +208,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "delivery_metadata" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        add_column_if_missing(conn, "delivery_obligations", "delivery_metadata", "delivery_metadata TEXT")
+
+
+def get_delivery_metadata(obligation_id):
+    import json
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute("SELECT delivery_metadata FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)).fetchone()
+    return json.loads(row[0]) if row and row[0] else {}
 
 
 def _transaction():
@@ -268,7 +279,8 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      delivery_metadata: Optional[dict] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -280,6 +292,10 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+        if delivery_metadata is not None:
+            import json
+            conn.execute("UPDATE delivery_obligations SET delivery_metadata=? WHERE obligation_id=?",
+                         (json.dumps(delivery_metadata), obligation_id))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -316,7 +332,8 @@ def mark_delivered(obligation_id: str) -> None:
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+    state = "refused" if error.startswith("discord_recipient_contract_refused:") else "failed"
+    _update_state(obligation_id, state, error=error)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -407,6 +424,9 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
                 continue  # no adapter this boot — claiming would spend an attempt on a no-op
+            if str(last_error or "").startswith("discord_recipient_contract_refused:"):
+                conn.execute("UPDATE delivery_obligations SET state='refused' WHERE obligation_id=?", (oid,))
+                continue
             flood_row = state == "failed" and is_flood_error(last_error)
             if flood_row and now < flood_not_before(updated_at, last_error):
                 # Still inside the platform's wait: adopt the dead owner's row without spending an attempt
@@ -538,7 +558,7 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE state IN ('delivered', 'abandoned', 'refused') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
