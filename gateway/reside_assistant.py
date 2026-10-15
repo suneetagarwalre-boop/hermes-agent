@@ -318,7 +318,7 @@ def _execute_task(principal, task_id, token, *, complete=None, report=None, retr
     return _task_result(principal, task_id)
 
 
-TASK_INTENT = re.compile(r'\b(?:create|open|start|coordinate|queue|run)\s+(?:(?:a|an|the|internal|scoped|reside)\s+){0,3}(?:task|job)\b|\b(?:coordinate|task)\s*:', re.I)
+TASK_INTENT = re.compile(r'^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:create|open|start|coordinate|queue|run)\s+(?:(?:a|an|the|internal|scoped|reside)\s+){0,3}(?:task|job)\b|^\s*(?:coordinate|task)\s*:', re.I)
 
 
 def coordinate(principal, event_id, question, answer, token, *, complete=None, report=None):

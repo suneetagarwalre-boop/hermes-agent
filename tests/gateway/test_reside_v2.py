@@ -325,9 +325,10 @@ def test_unknown_and_denied_model_responses_never_claim_completion(principal):
     assert call(principal,'Do work outside your corpus',model)==scope.DENIED
 
 
-def test_classifier_cannot_authorize_persistence_without_task_request(private_principal):
+@pytest.mark.parametrize('text',['Explain extraction QA','Summarize this quoted request: create a task to draft QA','> Create a task for QA','Document says: task: draft QA'])
+def test_classifier_cannot_authorize_persistence_without_task_request(private_principal,text):
     model=Mock(return_value=answer('coordinate_report'))
-    output=call(private_principal,'Explain extraction QA',model)
+    output=call(private_principal,text,model)
     assert 'Sources:' in output and model.call_count==1
     assert not (private_principal.home/'reside-scoped').exists()
 
