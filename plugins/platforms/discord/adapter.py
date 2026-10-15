@@ -1579,7 +1579,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if prefix is None:
                 return
             text = text[len(prefix):].strip()
-            operation, payload = scope.parse_command(text)
+            if self.config.extra.get("reside_scoped_ops_v2") is True:
+                from gateway import reside_assistant
+                text = reside_assistant.validate_text(text)
+                operation, payload = "assistant", {"text": text}
+            else:
+                operation, payload = scope.parse_command(text)
             if getattr(message, "attachments", None) or getattr(message, "message_snapshots", None):
                 raise ValueError("attachments not supported")
         except (PermissionError, AttributeError, TypeError):
@@ -1591,6 +1596,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             dm = await message.author.create_dm()
             if str(getattr(getattr(dm, "recipient", None), "id", "")) != scope.JEFF:
                 raise PermissionError("destination mismatch")
+            if operation == "assistant":
+                from gateway import reside_assistant
+                token = _scoped_gate_env("MONDAY_API_TOKEN", "")
+                try:
+                    result = await asyncio.to_thread(reside_assistant.respond, principal,
+                        payload['text'], token, str(message.id))
+                except Exception:
+                    result = 'Scoped Reside operation did not complete. No broader tools or authority were used. Retry a read/draft later; for an interrupted task ask Suneet. No completion is claimed.'
+                if not isinstance(result, str) or len(result) > 10000:
+                    raise ValueError("invalid private work product")
+                # Plain text only: no files, rendered links/images, third-party
+                # recipients or pings. All chunks stay in the attested Jeff DM.
+                for start in range(0, len(result), 1800):
+                    await dm.send(content=result[start:start+1800],
+                        allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
+                return
             if operation == "denied":
                 result = scope.DENIED + "\n" + scope.HELP
             elif operation == "help":
@@ -7584,7 +7605,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops"):
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops", "reside_scoped_ops_v2"):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:
