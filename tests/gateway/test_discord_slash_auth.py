@@ -147,7 +147,9 @@ def _make_interaction(
     if in_dm:
         channel = discord.DMChannel()
     elif in_thread:
-        channel = discord.Thread()
+        # This fixture only exercises isinstance/id/parent_id. Construct the
+        # shape without invoking discord.py's network-state constructor.
+        channel = object.__new__(discord.Thread)
         channel.id = channel_id
         channel.parent_id = parent_channel_id
         if channel_name is not None:

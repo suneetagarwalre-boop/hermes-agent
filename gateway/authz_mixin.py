@@ -633,6 +633,17 @@ class GatewayAuthorizationMixin:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
+        # Defense at the actual general-agent boundary, including restored
+        # sources, components, events and alternate adapter/batch entry points.
+        # This principal has a separate, non-agent operation broker only.
+        if source.platform == Platform.DISCORD:
+            from hermes_constants import get_hermes_home
+            from gateway.reside_scope import HOME, JEFF
+            if source.user_id == JEFF and (
+                adapter_profile == "hermesdiscord"
+                or (adapter_profile is None and get_hermes_home() == HOME)
+            ):
+                return False
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):

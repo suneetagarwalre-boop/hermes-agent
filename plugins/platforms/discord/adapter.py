@@ -1053,6 +1053,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
+        # Capture the trusted multiplex profile context, never an author-supplied
+        # field or process-global HERMES_PROFILE. Scoped collaborators do not
+        # enter the normal agent/session/tool pipeline.
+        from hermes_constants import get_hermes_home
+        self._reside_profile_home = get_hermes_home()
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
@@ -1539,8 +1544,84 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         return False, False
         return True, role_authorized
 
+    def _is_reside_restricted_sender(self, user_id: str) -> bool:
+        from gateway.reside_scope import restricted
+        return restricted(getattr(self, "_reside_profile_home", None), user_id)
+
+    async def _handle_reside_scoped(self, message: Any) -> None:
+        """Closed transport-bound broker; no agent, backfill, memory or tool dispatch.
+
+        Never fall back to owner tools on any failure. No shared-room business
+        output: the only dynamic response goes to the authenticated user's DM.
+        """
+        from gateway import reside_scope as scope
+        if self.config.extra.get("reside_scoped_ops") is not True:
+            return
+        principal = scope.Principal(
+            home=getattr(self, "_reside_profile_home", None),
+            user=str(message.author.id), bot=str(getattr(self._client.user, "id", "")),
+            guild=str(getattr(getattr(message, "guild", None), "id", "")),
+            channel=str(message.channel.id), is_bot=bool(getattr(message.author, "bot", True)))
+        try:
+            principal.authorize()
+            if (message.type not in {discord.MessageType.default, discord.MessageType.reply}
+                    or not self._self_is_raw_mentioned(message)
+                    or self._channel_response_addressed(message) is False):
+                return
+            allowed, ignored = self._get_allowed_channels(), self._get_ignored_channels()
+            if (allowed and "*" not in allowed and scope.ROOM not in allowed) or "*" in ignored or scope.ROOM in ignored:
+                return
+            # Prefix-only grammar: quotes, references, embeds, snapshots and
+            # attachments cannot choose an operation or supply extra context.
+            text = str(message.content).strip()
+            prefixes = (f"<@{scope.BOT}>", f"<@!{scope.BOT}>")
+            prefix = next((p for p in prefixes if text.startswith(p)), None)
+            if prefix is None:
+                return
+            text = text[len(prefix):].strip()
+            operation, payload = scope.parse_command(text)
+            if getattr(message, "attachments", None) or getattr(message, "message_snapshots", None):
+                raise ValueError("attachments not supported")
+        except (PermissionError, AttributeError, TypeError):
+            return
+        except ValueError:
+            operation, payload = "denied", {}
+        try:
+            # Resolve & attest the destination before any read or queue write.
+            dm = await message.author.create_dm()
+            if str(getattr(getattr(dm, "recipient", None), "id", "")) != scope.JEFF:
+                raise PermissionError("destination mismatch")
+            if operation == "denied":
+                result = scope.DENIED + "\n" + scope.HELP
+            elif operation == "help":
+                result = scope.HELP
+            elif operation == "report":
+                token = _scoped_gate_env("MONDAY_API_TOKEN", "")
+                result = await asyncio.to_thread(scope.automation_report, principal, token)
+            elif operation == "draft":
+                result = scope.draft(principal, payload)
+            elif operation == "coordinate":
+                result = await asyncio.to_thread(scope.coordinate, principal, payload)
+            else:
+                raise PermissionError("operation denied")
+            if not isinstance(result, str) or len(result) > 1900:
+                raise ValueError("invalid projection")
+            await dm.send(content=result, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            # No log of credentials, query responses, proposal/draft text, or
+            # exception messages. No retry and absolutely no agent fallback.
+            logger.warning("[%s] Scoped Reside operation failed closed message=%s; agent_dispatch=false",
+                           self.name, getattr(message, "id", "?"))
+
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
+        if self._is_reside_restricted_sender(str(getattr(message.author, "id", ""))):
+            if not self._dedup.is_duplicate(str(message.id)):
+                if self.config.extra.get("reside_scoped_ops") is True:
+                    await self._handle_reside_scoped(message)
+                else:
+                    await self._ack_unprivileged_human(message)
+            return False
         if not self._ready_event.is_set():
             try:
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
@@ -2391,6 +2472,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
+        # Scoped operations are live-request only; recovery never replays reads,
+        # private replies or proposal writes, and cannot enter the owner agent.
+        if self._is_reside_restricted_sender(str(getattr(message.author, "id", ""))):
+            return False
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
@@ -4067,6 +4152,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         context may pass on DISCORD_ALLOWED_CHANNELS (never voice). Role checks are guild-scoped:
         DMs use user IDs only unless ``discord.dm_role_auth_guild`` names one guild (no escalation).
         """
+        # Restricted principals cannot become owners through allow-all, pairing,
+        # role grants, slash commands or channel admission.
+        if self._is_reside_restricted_sender(user_id):
+            return False
         # getattr fallbacks: test fixtures build the adapter via object.__new__ and skip __init__.
         allowed_users = getattr(self, "_allowed_user_ids", set())
         allowed_roles = getattr(self, "_allowed_role_ids", set())
@@ -4164,6 +4253,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         Shared with side-effect-free callers (``/skill`` autocomplete returns [] per keystroke).
         Fail closed on malformed payloads: with an allowlist, a missing channel id/user REJECTS.
         """
+        if self._is_reside_restricted_sender(str(getattr(getattr(interaction, "user", None), "id", ""))):
+            return False, "Scoped Reside access uses the isolated message broker, not slash commands."
         chan_obj = getattr(interaction, "channel", None)
         in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
         channel_ids: set = set()
@@ -6139,6 +6230,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        # Defense in depth for direct/batched alternate entry points: not even
+        # session construction or attachment/backfill parsing for this sender.
+        if self._is_reside_restricted_sender(str(getattr(message.author, "id", ""))):
+            return False
         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
         #
         # Config (discord.* in config.yaml or DISCORD_* env vars):
@@ -6396,6 +6491,10 @@ def _component_check_auth(
     """
     user = getattr(interaction, "user", None)
     if user is None or getattr(user, "id", None) is None:
+        return False
+    from hermes_constants import get_hermes_home
+    from gateway.reside_scope import restricted
+    if restricted(get_hermes_home(), str(user.id)):
         return False
     # Scope-aware reads: interaction tasks inherit the owning profile's secret-scope contextvar;
     # under multiplex a raw os.getenv could return ANOTHER profile's allow-all flag.
@@ -7485,7 +7584,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract"):
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops"):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:
