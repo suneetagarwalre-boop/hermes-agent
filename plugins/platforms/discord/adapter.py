@@ -3053,6 +3053,45 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             kept.append(notice)
         return kept
 
+    def result_notification_text(self, content: str, recipient_id: Optional[str]) -> str:
+        """Bind a persisted subscription recipient; never infer recipients from summary prose."""
+        extra = self.config.extra
+        if not (extra.get("action_mentions") is True and extra.get("recipient_contract") is True):
+            return content
+        from plugins.platforms.discord.recipient_contract import (
+            declare_discord_recipients, prepare_discord_message, RecipientContractError)
+        if not recipient_id:
+            raise RecipientContractError("Discord result subscription lacks recipient identity")
+        declared = declare_discord_recipients(content, [recipient_id])
+        prepare_discord_message(declared, extra, _build_allowed_mentions(extra), require_contract=True)
+        return declared
+
+    async def _recipient_failure_notice(self, chat_id, reply_to, metadata):
+        """Expose a withheld final without leaking its content or retry-spamming the source."""
+        key = (str(chat_id), str(reply_to)) if reply_to else None
+        seen = getattr(self, "_recipient_failure_notices", None)
+        if seen is None:
+            seen = self._recipient_failure_notices = {}
+        if key and key in seen:
+            return seen[key]
+        channel = await self._resolve_channel((metadata or {}).get("thread_id") or chat_id)
+        if not channel or self._is_forum_parent(channel):
+            return None
+        # Reserve before await: simultaneous replays cannot both emit a notice.
+        if key:
+            seen[key] = None
+        notice = await channel.send(
+            content="Reply delivery blocked: Discord recipient metadata is missing or invalid. "
+                    "The intended response was withheld; please ask me to retry.",
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=False))
+        if key:
+            seen[key] = str(notice.id)
+            if len(seen) > 256:
+                seen.pop(next(iter(seen)))
+        logger.warning("[%s] Discord recipient contract blocked final source=%s notice=%s; no content delivered",
+                       self.name, reply_to, notice.id)
+        return str(notice.id)
+
     async def send(
         self,
         chat_id: str,
@@ -3140,11 +3179,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            from plugins.platforms.discord.recipient_contract import RecipientContractError
+            notice_id = None
+            if isinstance(e, RecipientContractError) and metadata and metadata.get("notify"):
+                try:
+                    notice_id = await self._recipient_failure_notice(chat_id, reply_to, metadata)
+                except Exception:
+                    logger.warning("[%s] Could not surface recipient delivery failure", self.name, exc_info=True)
             if _is_discord_transport_error(e):
                 # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
                 result = SendResult(success=False, error="send_path_degraded", retryable=True)
             else:
-                result = SendResult(success=False, error=str(e))
+                result = SendResult(success=False, error=str(e),
+                                    raw_response={"recipient_failure_notice_id": notice_id} if notice_id else None)
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
 
     @staticmethod
@@ -3160,12 +3207,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a forum thread post with the message as starter (forum channels reject direct
         sends; name from the first line). Chunk failures land in ``raw_response['warnings']``."""
+        mention_kwargs = ({"allowed_mentions": _build_allowed_mentions(self.config.extra)}
+                          if self.config.extra.get("action_mentions") is True else {})
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         thread_name = _derive_forum_thread_name(content)
         starter_content = chunks[0] if chunks else thread_name
         try:
-            thread = await forum_channel.create_thread(name=thread_name, content=starter_content)
+            thread = await forum_channel.create_thread(name=thread_name, content=starter_content, **mention_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
@@ -7387,7 +7436,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions"):
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract"):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:

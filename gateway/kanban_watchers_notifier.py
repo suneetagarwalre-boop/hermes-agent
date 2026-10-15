@@ -676,6 +676,16 @@ class _KanbanNotification:
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
         _send_res = None
+        if self.platform_str == "discord":
+            prepare_result = getattr(adapter, "result_notification_text", None)
+            if callable(prepare_result):
+                # Persisted authenticated subscriber identity, not task-summary names.
+                prepared = prepare_result(msg, sub.get("user_id"))
+                if not isinstance(prepared, str):
+                    raise TypeError("Discord result producer returned non-text")
+                if prepared != msg:
+                    metadata["notify"] = True
+                msg = prepared
         async def send_ping():
             nonlocal _send_res
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)

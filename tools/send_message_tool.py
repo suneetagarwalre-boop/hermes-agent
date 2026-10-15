@@ -700,6 +700,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         extra = getattr(pconfig, "extra", None) or {}
         try:
             message = prepare_discord_message(message, extra, _build_allowed_mentions(extra), require_contract=True)
+            if extra.get("action_mentions") is True:
+                # This logical send is already validated/prepared before splitting.
+                # Do not apply legacy vocative inference again to each chunk/caption.
+                from dataclasses import replace
+                pconfig = replace(pconfig, extra={**extra, "action_mentions": False})
         except ValueError as exc:
             return {"error": str(exc)}
     if platform == Platform.WEIXIN:

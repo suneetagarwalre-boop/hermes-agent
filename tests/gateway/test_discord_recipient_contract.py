@@ -91,7 +91,9 @@ async def test_strict_final_omission_is_explicit_failure_not_unpinged_delivery(c
     adapter._client = SimpleNamespace(get_channel=lambda _:channel,fetch_channel=AsyncMock())
     result = await adapter.send('555', 'Jeff needs to approve the draft.', metadata={'notify':True})
     assert not result.success and 'Missing Discord recipient contract' in result.error
-    channel.send.assert_not_awaited()
+    channel.send.assert_awaited_once()
+    assert 'Reply delivery blocked' in channel.send.await_args.kwargs['content']
+    assert 'approve the draft' not in channel.send.await_args.kwargs['content']
     dispatch = AsyncMock()
     monkeypatch.setattr(send_message_tool, '_send_plugin_standalone', dispatch)
     result = await send_message_tool._send_to_platform(Platform.DISCORD,config,'555','The report is ready for Jeff.')
