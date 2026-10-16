@@ -2896,6 +2896,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # The worker re-execs THIS interpreter (``sys.executable -m hermes_cli.main``). A pm-store
+    # python has no editable install and imports Hermes only via the ambient PYTHONPATH, which
+    # build_subprocess_env strips as Hermes-owned for a routed profile — the child then dies at
+    # import ("No module named 'hermes_cli'") and exits before any kanban call. Same interpreter,
+    # so the entries are safe to hand back (see restore_ambient_pythonpath).
+    if cmd[:3] == _module_hermes_argv():
+        from hermes_cli._subprocess_compat import restore_ambient_pythonpath
+        env = restore_ambient_pythonpath(env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
