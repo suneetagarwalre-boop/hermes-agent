@@ -3228,8 +3228,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if key:
             seen[key] = None
         notice = await channel.send(
-            content="Reply delivery blocked: Discord recipient metadata is missing or invalid. "
-                    "The intended response was withheld; please ask me to retry.",
+            content="Reply delivery blocked: this message names someone but its recipient routing is "
+                    "missing or invalid, so it was withheld rather than guessed. The failure is logged "
+                    "for repair; there is no need to resend.",
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=False))
         if key:
             seen[key] = str(notice.id)
@@ -3268,7 +3269,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             final_delivery = bool(metadata and metadata.get("notify")) or (
                 metadata is None and self.config.extra.get("recipient_contract") is True)
             if final_delivery and self.config.extra.get("recipient_contract") is True:
-                from plugins.platforms.discord.recipient_contract import prepare_discord_message
+                from plugins.platforms.discord.recipient_contract import (
+                    prepare_discord_message, repair_missing_declaration)
+                content, repaired = repair_missing_declaration(
+                    content, self.config.extra, (metadata or {}).get("discord_recipients"))
+                if repaired:
+                    logger.warning("[%s] Undeclared Discord recipients repaired (%s) source=%s chat=%s",
+                                   self.name, repaired, reply_to, chat_id)
                 prepare_discord_message(content, self.config.extra,
                                         _build_allowed_mentions(self.config.extra), require_contract=True)
             if thread_id:

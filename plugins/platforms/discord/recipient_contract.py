@@ -24,6 +24,41 @@ def declare_discord_recipients(text, recipients):
     return PREFIX + json.dumps(recipients) + "]]\n" + text
 
 
+def _names_anyone(text, extra):
+    """True unless the text provably names nobody: no mention token, no roster alias or ID.
+    An unreadable/empty roster cannot prove that, so it counts as naming someone."""
+    if "<@" in text or "@everyone" in text or "@here" in text:
+        return True
+    aliases = _load_alias_map((extra or {}).get("mention_roster_path"))
+    if not aliases:
+        return True
+    folded = text.casefold()
+    return any(uid in text for uid in set(aliases.values())) or any(
+        re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", folded) for alias in aliases)
+
+
+def repair_missing_declaration(text, extra, trusted_recipients=None):
+    """Single bounded repair of an UNDECLARED final message; returns ``(text, how)``.
+
+    ``trusted_recipients`` is persisted producer routing (e.g. a cron job's declared
+    ``discord_recipients``), never prose. Without it, ``[]`` is declared only when the text
+    names no roster member, so no intended notification can be lost. Anything else is returned
+    unchanged and ``prepare_discord_message`` still fails closed; malformed or nested
+    declarations are never repaired.
+    """
+    extra = extra or {}
+    if (not text or PREFIX in text or extra.get("action_mentions") is not True
+            or extra.get("recipient_contract") is not True):
+        return text, None
+    if trusted_recipients is not None:
+        if isinstance(trusted_recipients, list) and all(isinstance(r, str) and r for r in trusted_recipients):
+            return declare_discord_recipients(text, list(trusted_recipients)), "trusted_context"
+        return text, None
+    if not _names_anyone(text, extra):
+        return declare_discord_recipients(text, []), "no_recipient_named"
+    return text, None
+
+
 def prepare_discord_message(text, extra, allowed, *, require_contract=False):
     extra = extra or {}
     if not text:

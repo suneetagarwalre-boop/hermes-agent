@@ -1608,6 +1608,29 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
         enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
 
 
+DISCORD_RECIPIENT_REFUSAL = "discord_recipient_contract_refused:"
+
+
+def _declare_job_discord_recipients(t: "_TargetDelivery", text: str) -> str:
+    """A job's ``discord_recipients`` (jobs.json) is the trusted persisted recipient context for
+    its output: declare it once, before either lane, on contract-enforcing Discord targets only.
+    Absent key = unchanged (the adapter's bounded repair / fail-closed path decides)."""
+    recipients = t.job.get("discord_recipients")
+    extra = (getattr(t.pconfig, "extra", None)
+             or getattr(getattr(t.runtime_adapter, "config", None), "extra", None) or {})
+    if (recipients is None or str(t.platform_name).lower() != "discord" or not text.strip()
+            or extra.get("action_mentions") is not True or extra.get("recipient_contract") is not True):
+        return text
+    from plugins.platforms.discord.recipient_contract import (
+        PREFIX, RecipientContractError, declare_discord_recipients)
+    if PREFIX in text or not isinstance(recipients, list):
+        return text  # producer already declared, or malformed job config: let the contract judge
+    try:
+        return declare_discord_recipients(text, recipients)
+    except RecipientContractError:
+        return text
+
+
 def _deliver_via_live_adapter(
     t: _TargetDelivery, cleaned_text: str, media_files: list, *, target_errors: list,
     delivery_errors: list, unverified_targets: list,
@@ -2037,14 +2060,23 @@ def _deliver_result(
         if t is None:
             continue
         target_errors: list = []
+        target_content = _declare_job_discord_recipients(t, cleaned_delivery_content)
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
-            t, cleaned_delivery_content, media_files,
+            t, target_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+            if any(DISCORD_RECIPIENT_REFUSAL in err for err in target_errors):
+                # Logical policy refusal, not a transport fault: standalone re-runs the same
+                # contract and refuses identically, so record it once as terminal.
+                logger.error("Job '%s': Discord recipient contract refused delivery to %s; "
+                             "not retrying standalone (declare discord_recipients on the job)",
+                             job["id"], t.where)
+                delivery_errors.extend(target_errors)
+            else:
+                _deliver_standalone(
+                    t, target_content, media_files, target_errors, delivery_errors)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.

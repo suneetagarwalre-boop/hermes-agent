@@ -695,9 +695,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform_name == "discord":
         # Resolve the serialized producer contract BEFORE splitting (also cron/media).
         # Fail the entire logical send before the first network side effect.
-        from plugins.platforms.discord.recipient_contract import prepare_discord_message
+        from plugins.platforms.discord.recipient_contract import (
+            prepare_discord_message, repair_missing_declaration)
         from plugins.platforms.discord.adapter import _build_allowed_mentions
         extra = getattr(pconfig, "extra", None) or {}
+        message, _ = repair_missing_declaration(message, extra)
         try:
             allowed = _build_allowed_mentions(extra, message)
             from plugins.platforms.discord.recipient_contract import recipient_mention_policy
