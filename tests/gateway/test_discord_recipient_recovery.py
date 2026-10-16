@@ -1,6 +1,7 @@
 """Production wrapper, restored-session producer, and actual recovery boundaries."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from tests.gateway.test_discord_recipient_producers import adapter, JEFF
 from gateway import delivery_ledger as dl
@@ -88,7 +89,7 @@ def test_real_gateway_turn_refreshes_cached_producer_policy(adapter,monkeypatch,
     a.config.extra['recipient_contract']=strict
     ctx=SimpleNamespace(session_key='test',session_id='restored',source=SimpleNamespace(user_id='owner',user_name='Owner'),
         persist_user_display_kind=None,persist_user_display_metadata=None,moa_config=None,
-        inbound_message_id=None,mute_notification_reply=False)
+        inbound_message_id=None,mute_notification_reply=False,title_user_message=None)
     tr=TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source:a),ctx)
     monkeypatch.setattr(tr,'_native_image_run_message',lambda:'Internal Kanban result handoff for Jeff.')
     seen=[]

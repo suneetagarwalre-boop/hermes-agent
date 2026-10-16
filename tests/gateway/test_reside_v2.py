@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, AsyncMock
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from gateway import reside_assistant as v2, reside_scope as scope
 from gateway.reside_corpus import projection, CORPUS_DIGEST
@@ -278,7 +279,8 @@ async def test_v2_provider_error_is_private_not_fake_success_or_agent_fallback(b
 
 @pytest.mark.asyncio
 async def test_v2_does_not_admit_slash_component_recovery_or_batch_tools(broker):
-    from plugins.platforms.discord.adapter import DiscordAdapter, _component_check_auth
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from plugins.platforms.discord.adapter_component_auth import _component_check_auth
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     broker.config.extra['reside_scoped_ops_v2']=True
     m,dm=request(broker,'Explain extraction QA')

@@ -4,6 +4,7 @@ The repair may declare recipients from trusted persisted context, or ``[]`` only
 names nobody on the roster. Everything else still fails closed, with a notice that does not ask
 the user to rerun.
 """
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 
 from tests.gateway.test_discord_recipient_producers import adapter, JEFF  # noqa: F401

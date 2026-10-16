@@ -119,7 +119,7 @@ def test_scheduler_partial_persistence_and_delivery(monkeypatch, tmp_path):
     from cron import jobs
     monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
-    job = jobs.create_job(prompt="fixture only", schedule="every 1h", name="audit fixture")
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", name="audit fixture", deliver="telegram:fixture")
     job["vault_audit"] = {"target": str(tmp_path / "vault.md"), "state_dir": str(tmp_path / "state")}
     error = audit.PARTIAL_MARKER + " TimeoutExpired: local audit exceeded bound"
     final = "PARTIAL: local audit unavailable; payload preserved"

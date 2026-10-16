@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from plugins.platforms.discord.mention_rewriter import rewrite_plain_mentions
 from plugins.platforms.discord.adapter import DiscordAdapter, _build_allowed_mentions

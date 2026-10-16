@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from gateway.config import PlatformConfig
 from gateway.kanban_watchers_notifier import _KanbanNotification

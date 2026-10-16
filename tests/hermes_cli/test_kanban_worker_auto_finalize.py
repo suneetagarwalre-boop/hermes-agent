@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from tools.kanban_tools import finalize_current_worker_from_env as finalize
 
 
@@ -25,7 +26,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         yield conn
     finally:

@@ -1,5 +1,6 @@
 """Acceptance regressions for review round two: business grants and label drift."""
 import json
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from gateway import reside_scope as scope
 from tests.gateway.test_reside_scoped_ops import principal, row, data

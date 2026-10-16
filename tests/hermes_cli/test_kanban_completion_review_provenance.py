@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 META = {"business_domain": "infrastructure", "source_system": "test-ledger"}
@@ -21,7 +22,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda *a, **k: None)
     monkeypatch.setattr(kb, "_cleanup_workspace", lambda *a, **k: None)
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     assert Path(conn.execute("PRAGMA database_list").fetchone()[2]).is_relative_to(tmp_path)
     yield conn
     conn.close()

@@ -7,11 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from gateway import reside_scope as scope
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.config import Platform
-from plugins.platforms.discord.adapter import _apply_yaml_config, _component_check_auth
+from plugins.platforms.discord.adapter import _apply_yaml_config
+from plugins.platforms.discord.adapter_component_auth import _component_check_auth
 from tests.gateway.test_discord_inert_human_ack import scoped, message
 from tests.gateway.test_discord_free_response import adapter
 

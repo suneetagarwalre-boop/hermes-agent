@@ -1,6 +1,7 @@
 """Real ingress tests: acknowledge human mentions without admitting agent work."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from tests.gateway.test_discord_free_response import adapter, FakeTextChannel, FakeDMChannel, make_message
 from plugins.platforms.discord.adapter import _apply_yaml_config

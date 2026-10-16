@@ -1,6 +1,7 @@
 """Room-scoped triggers must not discard passive bot history or widen access."""
 from types import SimpleNamespace
 
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from tests.gateway.test_discord_free_response import (
     adapter, FakeDMChannel, FakeTextChannel, FakeThread, FakeHistoryChannel,

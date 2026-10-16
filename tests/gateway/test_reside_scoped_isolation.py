@@ -3,6 +3,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+import discord  # Load the installed SDK before legacy fake-adapter fixtures.
 import pytest
 from gateway import reside_scope as scope
 from tests.gateway.test_reside_scoped_ops import broker, principal, data, row, request
