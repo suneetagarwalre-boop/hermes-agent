@@ -63,3 +63,19 @@ def test_probe_rejects_unstamped_200_and_oversized_body():
     )
 
     assert (alive, body) == (False, None)
+
+
+def test_probe_credential_only_reaches_detailed_endpoint():
+    seen = []
+
+    def urlopen(request, timeout):
+        seen.append((request.full_url, request.get_header("Authorization")))
+        if request.full_url.endswith("/health/detailed"):
+            raise OSError("detailed unavailable")
+        return _Response({"platform": "hermes-agent", "status": "ok"})
+
+    assert probe_gateway_health("http://gateway:8642", urlopen=urlopen, api_key="fixture-key")[0]
+    assert seen == [
+        ("http://gateway:8642/health/detailed", "Bearer fixture-key"),
+        ("http://gateway:8642/health", None),
+    ]

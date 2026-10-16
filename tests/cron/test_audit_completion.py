@@ -1,5 +1,6 @@
 """Local fixtures only: no cron agent, board, network, or real vault accesses."""
 import json
+import shlex
 import subprocess
 import sys
 import uuid
@@ -96,7 +97,7 @@ def test_fresh_prompt(case):
     first, text = audit.completion_prompt({"vault_audit": config})
     second, _ = audit.completion_prompt({"vault_audit": config})
     assert first is not None and first != second and first in text and "CRON_STATUS" in text
-    assert str(Path(audit.__file__).resolve()) in text
+    assert shlex.quote(str(Path(audit.__file__).resolve())) in text
 
 
 @pytest.mark.parametrize("failure", [FileNotFoundError("helper unavailable"), subprocess.TimeoutExpired("verify", 12)])
@@ -126,7 +127,13 @@ def test_scheduler_partial_persistence_and_delivery(monkeypatch, tmp_path):
     monkeypatch.setattr(scheduler, "run_job", lambda *a, **kw: (False, "fixture", final, error))
     monkeypatch.setattr(scheduler, "save_job_output", lambda *a: str(tmp_path / "output.md"))
     delivered = []
-    monkeypatch.setattr(scheduler, "_deliver_result", lambda j, content, **kw: delivered.append(content))
+    from cron import delivery_queue
+    def enqueue(execution_id, queued_job, content, **kwargs):
+        delivered.append(content)
+        assert kwargs["for_failure"] is True
+        return {"status": "queued"}
+    monkeypatch.setattr(delivery_queue, "enqueue", enqueue)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **kw: pytest.fail("queue must own delivery"))
     monkeypatch.setattr(scheduler, "create_execution", lambda *a, **kw: {"id": "fixture"})
     monkeypatch.setattr(scheduler, "mark_execution_running", lambda *a: {})
     monkeypatch.setattr(scheduler, "finish_execution", lambda *a, **kw: None)

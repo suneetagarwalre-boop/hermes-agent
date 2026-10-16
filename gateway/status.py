@@ -415,6 +415,7 @@ def probe_gateway_health(
     health_url: Optional[str], *, timeout: float = 1.0,
     urlopen: Callable[..., Any] = urllib.request.urlopen,
     api_key: Optional[str] = None,
+    max_response_bytes: int = _GATEWAY_HEALTH_MAX_RESPONSE_BYTES,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
     """Probe detailed then simple health within one deadline and validate the response identity."""
     if not health_url:
@@ -434,8 +435,8 @@ def probe_gateway_health(
             with urlopen(req, timeout=attempt_timeout) as resp:
                 if getattr(resp, "status", None) != 200:
                     continue
-                raw = resp.read(_GATEWAY_HEALTH_MAX_RESPONSE_BYTES + 1)
-                if len(raw) > _GATEWAY_HEALTH_MAX_RESPONSE_BYTES:
+                raw = resp.read(max_response_bytes + 1)
+                if len(raw) > max_response_bytes:
                     continue
                 body = json.loads(raw)
         except Exception:

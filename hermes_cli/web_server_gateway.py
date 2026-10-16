@@ -46,6 +46,7 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
         timeout=_GATEWAY_HEALTH_TIMEOUT,
         urlopen=urllib.request.urlopen,
         api_key=os.environ.get("API_SERVER_KEY", "").strip(),
+        max_response_bytes=_DASHBOARD_JSON_RESPONSE_BODY_MAX_BYTES,
     )
 
 

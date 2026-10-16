@@ -28,7 +28,9 @@ class TestProbeGatewayHealth:
 
         assert alive is False
         assert body is None
-        assert timeouts == [0.75, 0.75]
+        assert len(timeouts) == 2
+        assert 0 < timeouts[0] <= 0.375
+        assert 0 < timeouts[1] <= 0.75
 
     def test_detailed_fails_falls_back_to_simple_health(self, monkeypatch):
         """If /health/detailed fails, falls back to /health."""
@@ -43,7 +45,7 @@ class TestProbeGatewayHealth:
                 raise ConnectionError("detailed failed")
             mock_resp = MagicMock()
             mock_resp.status = 200
-            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.read.return_value = json.dumps({"platform": "hermes-agent", "status": "ok"}).encode()
             mock_resp.__enter__ = MagicMock(return_value=mock_resp)
             mock_resp.__exit__ = MagicMock(return_value=False)
             return mock_resp
@@ -72,7 +74,7 @@ class TestProbeGatewayHealth:
 
             def read(self, size=-1):
                 captured["size"] = size
-                data = json.dumps({"status": "ok", "pid": 42}).encode()
+                data = json.dumps({"platform": "hermes-agent", "status": "ok", "pid": 42}).encode()
                 return data if size < 0 else data[:size]
 
         monkeypatch.setattr(
@@ -91,7 +93,7 @@ class TestProbeGatewayHealth:
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
         monkeypatch.setattr(
-            _web_server_gateway, "_DASHBOARD_JSON_RESPONSE_BODY_MAX_BYTES", 16
+            _web_server_gateway, "_DASHBOARD_JSON_RESPONSE_BODY_MAX_BYTES", 64
         )
         calls = []
 
@@ -113,8 +115,8 @@ class TestProbeGatewayHealth:
         def mock_urlopen(req, **kwargs):
             calls.append(req.full_url)
             if len(calls) == 1:
-                return _Resp(b"x" * 17)
-            return _Resp(json.dumps({"status": "ok"}).encode())
+                return _Resp(b"x" * 65)
+            return _Resp(json.dumps({"platform": "hermes-agent", "status": "ok"}).encode())
 
         monkeypatch.setattr(_web_server_gateway.urllib.request, "urlopen", mock_urlopen)
         alive, body = _web_server_gateway._probe_gateway_health()
@@ -142,7 +144,7 @@ class TestProbeGatewayHealthAuth:
                 detailed_behavior()
             mock_resp = MagicMock()
             mock_resp.status = 200
-            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.read.return_value = json.dumps({"platform": "hermes-agent", "status": "ok"}).encode()
             mock_resp.__enter__ = MagicMock(return_value=mock_resp)
             mock_resp.__exit__ = MagicMock(return_value=False)
             return mock_resp
@@ -158,7 +160,7 @@ class TestProbeGatewayHealthAuth:
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
         requests = self._recording_urlopen(
             monkeypatch,
-            lambda: json.dumps({"status": "ok"}),
+            lambda: json.dumps({"platform": "hermes-agent", "status": "ok"}),
         )
 
         alive, _body = _web_server_gateway._probe_gateway_health()
@@ -189,7 +191,7 @@ class TestProbeGatewayHealthAuth:
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
         requests = self._recording_urlopen(
             monkeypatch,
-            lambda: json.dumps({"status": "ok"}),
+            lambda: json.dumps({"platform": "hermes-agent", "status": "ok"}),
         )
 
         alive, _body = _web_server_gateway._probe_gateway_health()
