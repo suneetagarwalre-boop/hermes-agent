@@ -101,9 +101,25 @@ def _context(p):
     return [str(p.home),p.user,p.bot,p.guild,p.channel,p.parent,p.dm,p.recipient]
 
 
+def _folder(p):
+    p.authorize()
+    root=os.open(p.home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for name in ('reside-scoped','requests-v3'):
+            try:os.mkdir(name,0o700,dir_fd=root)
+            except FileExistsError:pass
+            fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root)
+            os.close(root);root=fd
+            if os.fstat(root).st_uid!=os.getuid() or os.fstat(root).st_mode & 0o077:
+                raise PermissionError('private V3 storage required')
+        return root
+    except BaseException:
+        os.close(root);raise
+
+
 def put(p,event,suffix,value):
     p.authorize()
-    fd=v2._folder(p)
+    fd=_folder(p)
     try: _write(fd,_name(event,suffix),value)
     finally: os.close(fd)
 
@@ -123,7 +139,7 @@ def _write(fd,name,value):
 
 def get(p,event,suffix):
     p.authorize()
-    fd=v2._folder(p)
+    fd=_folder(p)
     try: return v2._read(fd,_name(event,suffix))
     finally: os.close(fd)
 
@@ -136,7 +152,7 @@ def claim(p,event,text):
     try:
         existing=get(p,event,'request')
     except FileNotFoundError:
-        fd=v2._folder(p)
+        fd=_folder(p)
         try:
             if len(os.listdir(fd)) >= 10000: raise ValueError('storage capacity reached')
             try: _write(fd,_name(event,'request'),request)
@@ -180,7 +196,7 @@ def outcome(p,event):
 def recent(p,before=None):
     """Only this principal+room's recent completed V3 turns; no owner backfill."""
     from datetime import UTC,datetime
-    fd=v2._folder(p)
+    fd=_folder(p)
     try:
         names=[n for n in os.listdir(fd) if re.fullmatch(r'v3-[0-9]{15,22}\.request\.json',n)]
         names.sort(key=lambda n:int(n.split('.')[0][3:]),reverse=True)
@@ -240,8 +256,8 @@ def registration_answer(p,text,client=None):
             month[:3].lower()!=date.strftime('%b').lower() or int(day)!=date.day
             or (year and int(year)!=date.year) for month,day,year in named)):
         return 'The title and date do not identify the same single verified webinar. Specify one webinar title/ID and date; no registration count is claimed.'
-    if row['occurrences']:
-        return 'This webinar has recurring occurrences. Specify the occurrence date; no mixed-series registration total is claimed.'
+    if row['occurrences'] or row.get('type') in (6,9):
+        return 'Recurring-occurrence totals are not implemented in this broker; no mixed-series registration count is claimed. Non-recurring webinar aggregates and internal drafts/reports remain available.'
     count=business.registration_counts(p,row['id'],client)
     return (f"{count['approved']} approved registrations for {count['title']}.\n"
         f"Pending: {count['pending']}; denied: {count['denied']}. Counts are separate statuses, not an attendance total.\n"
@@ -288,6 +304,7 @@ def synthesize(p,text,*,client=None,complete=None,history=()):
         r=refs[key]
         links.append(f"[{key}] "+(r['title']+' '+r['url'] if key.startswith('doc:') else r['source']+' (reviewed 2026-10-15 process projection)'))
     result=heading+'\n'+answer['body'].replace('@','@\u200b')+'\n\nSources:\n'+'\n'.join(links)
+    result+='\nExecution boundary: analysis/draft only. No source records, human judgments, permissions, sends, enrollments, workflows, assignments or spending were changed.'
     if docs['unavailable']:result+='\nSome matching documents were unavailable or changed since source review. No unsupported live fact is verified.'
     if coordinated:
         result+='\nFixed Reside work-product task completed now. Execution ceiling: this report/draft only; no humans assigned, external sends, scheduling, source writes, enrollments or production workflow executed.'

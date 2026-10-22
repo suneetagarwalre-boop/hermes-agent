@@ -139,6 +139,7 @@ def webinars(principal, client=None):
         if not isinstance(title,str) or not title.strip() or len(title)>300:
             raise ValueError('invalid webinar title')
         result.append({'id':wid,'title':title,'start':row.get('start_time'),
+            'type':row.get('type'),
             'occurrences':[{'id':str(o['occurrence_id']),'start':o['start_time']}
                            for o in (row.get('occurrences') or []) if o.get('status')!='deleted']})
     return result
@@ -156,6 +157,13 @@ def registration_counts(principal, webinar_id, client=None, *, occurrence=None):
     if webinar_id not in approved:
         raise PermissionError('unknown Reside webinar')
     row = approved[webinar_id]
+    detail=client.zoom('/webinars/'+webinar_id)
+    if str(detail.get('id'))!=webinar_id or detail.get('host_id')!=ZOOM_HOST:
+        raise PermissionError('selected webinar identity drift')
+    # Host list responses can omit recurring occurrences. Never mistake that
+    # omission for a single event and report a mixed-series registration total.
+    if type(detail.get('type')) is not int or detail['type']!=5:
+        raise ValueError('recurring/unknown webinar aggregate unsupported')
     if row['occurrences']:
         if occurrence not in {o['id'] for o in row['occurrences']}:
             raise ValueError('specify webinar occurrence')

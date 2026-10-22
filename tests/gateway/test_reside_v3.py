@@ -33,7 +33,7 @@ class Source:
     def __init__(self):
         self.calls=[]
         self.host={'id':business.ZOOM_HOST,'account_id':business.ZOOM_ACCOUNT,'email':business.ZOOM_EMAIL}
-        self.row={'id':85284217825,'host_id':business.ZOOM_HOST,'topic':'Stop Chasing Leads: Build the Team That Converts Them','start_time':'2026-10-22T17:00:00Z'}
+        self.row={'id':85284217825,'host_id':business.ZOOM_HOST,'topic':'Stop Chasing Leads: Build the Team That Converts Them','start_time':'2026-10-22T17:00:00Z','type':5}
         self.page={'webinars':[self.row],'next_page_token':''}
         self.raw=b'Reside webinar setup: verify host, date, registration form, approval and source links.\n'
         self.grant={'id':'approvedDoc','name':'Reside webinar SOP','parents':['resideRoot'],'owners':['jeffrey@resideplatform.com'],'keywords':['webinar','sop','draft'],'sha256':hashlib.sha256(self.raw).hexdigest()}
@@ -89,7 +89,7 @@ def test_actual_registration_question_returns_aggregate_not_people(principal,sou
     assert 'MUST_NOT_ESCAPE' not in json.dumps(result) and 'PRIVATE_REGISTRANT' not in json.dumps(result)
     assert all(p[1]['page_size']==1 for p in source.calls if p[0].endswith('/registrants'))
     assert all('participants' not in p[0] for p in source.calls)
-    persisted=''.join(f.read_text() for f in (principal.home/'reside-scoped/tasks-v2').glob('v3-*'))
+    persisted=''.join(f.read_text() for f in (principal.home/'reside-scoped/requests-v3').glob('v3-*'))
     assert 'MUST_NOT_ESCAPE' not in persisted
 
 
@@ -484,7 +484,7 @@ async def test_storage_failure_gets_one_safe_error_and_no_agent(live,monkeypatch
 
 def test_immutable_capability_envelope_rechecked_before_execution(principal,source):
     app.claim(principal,EVENT,'Create a task to draft webinar SOP')
-    path=principal.home/'reside-scoped/tasks-v2'/('v3-'+EVENT+'.request.json')
+    path=principal.home/'reside-scoped/requests-v3'/('v3-'+EVENT+'.request.json')
     envelope=json.loads(path.read_text());envelope['capabilities']=['owner','shell','send']
     path.write_text(json.dumps(envelope))
     with pytest.raises(PermissionError):app.execute(principal,EVENT,client=source)
@@ -516,3 +516,10 @@ def test_legacy_pinned_status_command_retains_original_read_only_broker(principa
     app.claim(principal,EVENT,'reside report')
     assert app.execute(principal,EVENT)['body'].startswith('Pinned-three')
     read.assert_called_once_with(principal,'exact-profile-token')
+
+
+@pytest.mark.parametrize('kind',[6,9,None,True])
+def test_recurring_type_or_omitted_occurrences_never_becomes_single_count(principal,source,kind):
+    source.row['type']=kind
+    with pytest.raises(ValueError):business.registration_counts(principal,'85284217825',source)
+    assert all(not p.endswith('/registrants') for p,_ in source.calls)
