@@ -532,3 +532,25 @@ def test_fixed_report_executor_is_server_selected_not_model_downgraded(principal
     with pytest.raises(PermissionError):
         app.synthesize(principal,question,client=source,complete=lambda m:json.dumps(
             {'kind':'draft','body':'Task proposal only','sources':['doc:approvedDoc']}))
+
+
+@pytest.mark.asyncio
+async def test_status_duplicate_retains_snapshot_after_original_retry(live,source):
+    original,_unused=make(live,'Draft webinar SOP')
+    p=transport.principal(live,original)
+    app.claim(p,EVENT,'Draft webinar SOP')
+    first=app.execute(p,EVENT,client=source,complete=Mock(side_effect=RuntimeError('model unavailable')))
+    assert first['state']=='error'
+    status,dm=make(live,'request status '+EVENT,event='1562641484979900538')
+    await live._dispatch_discord_message(status)
+    assert dm.send.await_count==1
+    snapshot=app.outcome(transport.principal(live,status),str(status.id))
+    model=Mock(return_value=json.dumps({'kind':'draft','body':'Completed private draft: verify the host and approval.','sources':['doc:approvedDoc']}))
+    assert app.execute(p,EVENT,retry=True,client=source,complete=model)['state']=='complete'
+    await live._dispatch_discord_message(status)
+    await live._dispatch_recovered_message(status)
+    assert dm.send.await_count==1
+    assert app.outcome(transport.principal(live,status),str(status.id))==snapshot
+    fresh,new_dm=make(live,'request status '+EVENT,event='1562641484979900539')
+    await live._dispatch_discord_message(fresh)
+    assert any('Completed private draft' in c.kwargs['content'] for c in new_dm.send.await_args_list)

@@ -168,16 +168,27 @@ async def _run(adapter,message,p):
     match=re.fullmatch(r'(?:reside\s+)?(request status|retry request)\s+([0-9]{15,22})',text,re.IGNORECASE)
     try:
         if match:
-            target=match[2]
-            origin=app.recovery_principal(p,target)
-            result=app.outcome(origin,target)
-            if match[1].lower()=='retry request':
-                result=await asyncio.wait_for(asyncio.to_thread(app.execute,origin,target,retry=True),TIMEOUT)
+            event=str(message.id)
+            result=app.outcome(p,event)
             if result is None:
-                result={'body':'Original request is still running or interrupted; no completion is claimed. Resend the original question for a fresh read-only attempt.','attempt':1}
+                # Bind this explicit recovery request to one immutable response.
+                # A later retry of the ORIGINAL must not turn a duplicate status
+                # event into a new delivery or a different private work product.
+                target=match[2]
+                origin=app.recovery_principal(p,target)
+                recovered=app.outcome(origin,target)
+                if match[1].lower()=='retry request':
+                    recovered=await asyncio.wait_for(asyncio.to_thread(app.execute,origin,target,retry=True),TIMEOUT)
+                body=(recovered['body'] if recovered else
+                    'Original request is still running or interrupted; no completion is claimed. Resend the original question for a fresh read-only attempt.')
+                snapshot={'policy':app.POLICY_DIGEST,'event':event,'attempt':1,
+                    'state':recovered['state'] if recovered else 'complete',
+                    'body':body,'completed':datetime.now(UTC).isoformat()}
+                try:app.put(p,event,'result-1',snapshot)
+                except FileExistsError:pass
+                result=app.outcome(p,event)
             # Explicit recovery has its OWN delivery receipt/nonces, never mutates
             # or replays ambiguous old sends. User asked for this copy.
-            event=str(message.id)
         else:
             event=str(message.id)
             result=app.outcome(p,event)
