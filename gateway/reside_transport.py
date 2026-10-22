@@ -168,10 +168,10 @@ async def _run(adapter,message,p):
     try:
         if match:
             target=match[2]
-            app.request(p,target)  # same exact sender/room/policy; no other session.
-            result=app.outcome(p,target)
+            origin=app.recovery_principal(p,target)
+            result=app.outcome(origin,target)
             if match[1].lower()=='retry request':
-                result=await asyncio.wait_for(asyncio.to_thread(app.execute,p,target,retry=True),TIMEOUT)
+                result=await asyncio.wait_for(asyncio.to_thread(app.execute,origin,target,retry=True),TIMEOUT)
             if result is None:
                 result={'body':'Original request is still running or interrupted; no completion is claimed. Resend the original question for a fresh read-only attempt.','attempt':1}
             # Explicit recovery has its OWN delivery receipt/nonces, never mutates
@@ -188,6 +188,8 @@ async def _run(adapter,message,p):
         if not p.dm:await _notice_once(adapter,message,p,'delivered')
     except TimeoutError:
         await _notice_once(adapter,message,p,'timeout')
+    except discord.Forbidden:
+        await _notice_once(adapter,message,p,'dm_blocked')
     except Exception:
         logger.warning('Reside V3 failed event=%s reason=operation_or_delivery agent_dispatch=false',message.id)
         await _notice_once(adapter,message,p,'error')

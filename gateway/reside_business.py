@@ -187,7 +187,8 @@ def documents(principal, question, client=None):
     terms = set(re.findall(r'[a-z0-9]{3,}', question.lower())) - {
         'the','and','for','what','how','can','you','please','reside','draft','report','task'}
     ranked = sorted(catalog(), key=lambda r:(-len(terms & set(r['keywords'])),r['id']))
-    chosen = [r for r in ranked if terms & set(r['keywords'])][:3]
+    best=max((len(terms & set(r['keywords'])) for r in ranked),default=0)
+    chosen = [r for r in ranked if len(terms & set(r['keywords']))>=max(1,(best+1)//2)][:3]
     output, unavailable = [], []
     for grant in chosen:
         try:
@@ -205,16 +206,13 @@ def documents(principal, question, client=None):
             paragraphs = text.replace('\r\n','\n').split('\n')
             # Never transmit the illustrative Zoom passcode line to synthesis.
             paragraphs = [p for p in paragraphs if 'passcode:' not in p.lower()]
-            # At most 12k chars per doc: use relevance windows and disclose excerpt.
-            if len(text)>12000:
-                indexes = set(range(min(15,len(paragraphs))))
-                scored = sorted(range(len(paragraphs)),key=lambda i:-len(terms & set(re.findall(r'[a-z0-9]{3,}',paragraphs[i].lower()))))
-                for i in scored[:18]: indexes.update(range(max(0,i-2),min(len(paragraphs),i+4)))
-                text='\n'.join(paragraphs[i] for i in sorted(indexes))[:12000]
-            else: text='\n'.join(paragraphs)
+            # Reviewed catalog's largest source is ~42k bytes. Keep the whole
+            # procedural sequence rather than silently dropping approval steps.
+            if len(raw)>48000:raise ValueError('reviewed document size bound')
+            text='\n'.join(paragraphs)
             output.append({'id':'doc:'+grant['id'],'title':grant['name'],
                 'verified_at':now(),'modified':meta['modifiedTime'],'text':text,
-                'excerpt':len(raw)>12000,'url':'https://docs.google.com/document/d/'+grant['id']+'/edit'})
+                'excerpt':False,'url':'https://docs.google.com/document/d/'+grant['id']+'/edit'})
         except Exception:
             unavailable.append('doc:'+grant['id'])
     return {'documents':output,'unavailable':unavailable,
