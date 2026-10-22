@@ -17,10 +17,11 @@ from pathlib import Path
 from gateway import reside_assistant as v2
 from gateway import reside_business as business
 from gateway import reside_scope as scope
+from gateway import reside_event_context as events
 from gateway.reside_corpus import projection
 
 ROOMS = frozenset((scope.ROOM, '1562553216045158523', '1562916299007463587'))
-POLICY = 'reside-business-v3.2'
+POLICY = 'reside-business-v3.3'
 logger=logging.getLogger(__name__)
 CAPABILITIES = ('reside_webinar_aggregates_read','reviewed_reside_documents_read',
                 'internal_analysis','internal_draft','fixed_work_product_execution')
@@ -218,52 +219,64 @@ def recent(p,before=None):
 
 
 def _webinar_match(text,rows):
-    """Natural input filters only an already-authorized host inventory."""
-    ids=set(re.findall(r'\b[0-9]{9,12}\b',text))
-    if ids:
-        found=[r for r in rows if r['id'] in ids]
-        return found[0] if len(found)==1 and len(ids)==1 else None
-    words=set(re.findall(r'[a-z]{3,}',text.lower()))-{'the','for','have','webinar','registered','registration','people','how','many','what','which','happening','number','october','oct','tomorrow','today','reside'}
-    ranked=sorted([(len(words & set(re.findall(r'[a-z]{3,}',r['title'].lower()))),r) for r in rows],key=lambda x:-x[0])
-    if ranked and ranked[0][0]>=2 and (len(ranked)==1 or ranked[0][0]>ranked[1][0]):return ranked[0][1]
-    # Explicit ISO or named month/day dates and relative dates are caller context,
-    # not arbitrary resource IDs. Disambiguate against canonical start timestamps.
-    from datetime import datetime,timedelta
-    from zoneinfo import ZoneInfo
-    day=None
-    now=datetime.now(ZoneInfo('America/Los_Angeles')).date()
-    if re.search(r'\btoday\b',text,re.IGNORECASE): day=str(now)
-    elif re.search(r'\btomorrow\b',text,re.IGNORECASE): day=str(now+timedelta(days=1))
-    for r in rows:
-        if not r.get('start'):continue
-        date=datetime.fromisoformat(r['start']).astimezone(ZoneInfo('America/Los_Angeles')).date()
-        month=date.strftime('%B')
-        if str(date) in text or re.search(r'\b'+month+r'\s*'+str(date.day)+r'\b',text,re.IGNORECASE): day=str(date)
-    found=[r for r in rows if r.get('start') and str(datetime.fromisoformat(r['start']).astimezone(ZoneInfo('America/Los_Angeles')).date())==day]
-    return found[0] if len(found)==1 else None
+    return events.match(text,rows,business.now())
 
 
-def registration_answer(p,text,client=None):
+def _registration_result(p,text,client=None,*,fallback_id=None):
     rows=business.webinars(p,client)
-    row=_webinar_match(text,rows)
+    row=events.match(text,rows,business.now(),fallback_id)
     if row is None:
-        return 'Which Reside webinar/date? Available verified titles: '+ '; '.join(r['title']+' ('+str(r['start'])+', '+r['id']+')' for r in rows)[:3000]
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    date=datetime.fromisoformat(row['start']).astimezone(ZoneInfo('America/Los_Angeles')).date()
-    iso=set(re.findall(r'\b[0-9]{4}-[0-9]{2}-[0-9]{2}\b',text))
-    named=re.findall(r'\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*([0-9]{1,2})(?:,?\s+(20[0-9]{2}))?\b',text,re.IGNORECASE)
-    if ((iso and iso!={str(date)}) or any(
-            month[:3].lower()!=date.strftime('%b').lower() or int(day)!=date.day
-            or (year and int(year)!=date.year) for month,day,year in named)):
-        return 'The title and date do not identify the same single verified webinar. Specify one webinar title/ID and date; no registration count is claimed.'
+        return ('Which Reside webinar/date? The title, ID and every supplied date must identify one verified event; no registration count is claimed. Available verified titles: '+ '; '.join(r['title']+' ('+str(r['start'])+', '+r['id']+')' for r in rows)[:3000], None)
     if row['occurrences'] or row.get('type') in (6,9):
-        return 'Recurring-occurrence totals are not implemented in this broker; no mixed-series registration count is claimed. Non-recurring webinar aggregates and internal drafts/reports remain available.'
-    count=business.registration_counts(p,row['id'],client)
-    return (f"{count['approved']} approved registrations for {count['title']}.\n"
+        return ('Recurring-occurrence totals are not implemented in this broker; no mixed-series registration count is claimed. Non-recurring webinar aggregates and internal drafts/reports remain available.', None)
+    count=business.registration_counts(p,row['id'],client,expected_event=row)
+    body=(f"{count['approved']} approved registrations for {count['title']}.\n"
         f"Pending: {count['pending']}; denied: {count['denied']}. Counts are separate statuses, not an attendance total.\n"
         f"Scheduled: {count['start']}; Zoom webinar {count['id']}; host {count['host']}.\n"
         f"Verified {count['as_of']} from Zoom registration total_records (read-only). Only aggregate counts are retained/disclosed; no registrant names enter the model or output.")
+    return body, {'kind':'registrations','id':row['id'], 'account':business.ZOOM_ACCOUNT,
+                  'host':business.ZOOM_HOST}
+
+
+def registration_answer(p,text,client=None):
+    return _registration_result(p,text,client)[0]
+
+
+def aggregate_context(p,before):
+    """Last turn's server-owned selection, never model prose; 5 minute TTL.
+
+    A clarification, unrelated turn, error or uncertain in-flight turn invalidates
+    selection. Other principals/rooms/policies cannot supply fallback context.
+    """
+    from datetime import datetime
+    fd=_folder(p)
+    try:
+        names=sorted((n for n in os.listdir(fd) if re.fullmatch(r'v3-[0-9]{15,22}\.request\.json',n)),
+                     key=lambda n:int(n.split('.')[0][3:]),reverse=True)
+        for name in names[:100]:
+            event=name.split('.')[0][3:]
+            if int(event)>=int(before):continue
+            stored=v2._read(fd,name)
+            if stored['principal']!=_context(p) or stored['policy']!=POLICY_DIGEST:continue
+            result=outcome(p,event)
+            if result is None or result['state']!='complete':return None
+            age=(datetime.fromisoformat(business.now())-datetime.fromisoformat(result['completed'])).total_seconds()
+            if not 0<=age<=300:return None
+            context=result.get('aggregate')
+            if (not isinstance(context,dict) or set(context)!={'kind','id','account','host'}
+                    or context['kind']!='registrations' or context['account']!=business.ZOOM_ACCOUNT
+                    or context['host']!=business.ZOOM_HOST
+                    or not re.fullmatch(r'[0-9]{9,12}',context['id'])):return None
+            return context
+        return None
+    finally:os.close(fd)
+
+
+def registration_intent(text):
+    return (not v2.TASK_INTENT.search(text)
+            and re.search(r'\b(?:how many|number|count|total|registered for)\b',text,re.IGNORECASE)
+            and re.search(r'\b(?:registrations?|registered|registrants?)\b',text,re.IGNORECASE)
+            and re.search(r'\bwebinar\b',text,re.IGNORECASE))
 
 
 def _parse(raw,ids):
@@ -338,16 +351,20 @@ def execute(p,event,*,retry=False,client=None,complete=None):
         try:put(p,event,'attempt-'+str(attempt),{'policy':POLICY_DIGEST,'event':event,'started':business.now()})
         except FileExistsError:return outcome(p,event)
         text=stored['question']
+        aggregate=None
         try:
             if text.lower() in ('help','reside','reside help','what can you do?'):body=HELP
             elif PROTECTED.search(text) or DIRECT_ACTION.search(text):body=DENIED
             elif text.lower() in ('reside report','reside lookup automation-health'):
                 body=scope.automation_report(p,v2.profile_monday_token(p))
-            elif (not v2.TASK_INTENT.search(text)
-                  and re.search(r'\b(?:how many|number|count|total|registered for)\b',text,re.IGNORECASE)
-                  and re.search(r'\b(?:registrations?|registered|registrants?)\b',text,re.IGNORECASE)
-                  and re.search(r'\bwebinar\b',text,re.IGNORECASE)):
-                body=registration_answer(p,text,client)
+            elif registration_intent(text):
+                body,aggregate=_registration_result(p,text,client)
+            elif events.FOLLOWUP.fullmatch(text.strip()):
+                context=aggregate_context(p,event)
+                if context is None:
+                    body='Which Reside webinar/date? No unambiguous recent registration selection is available in this conversation; no current count is claimed.'
+                else:
+                    body,aggregate=_registration_result(p,text,client,fallback_id=context['id'])
             else:body=synthesize(p,text,client=client,complete=complete,history=recent(p,event))
             state='complete'
         except Exception as exc:
@@ -358,7 +375,7 @@ def execute(p,event,*,retry=False,client=None,complete=None):
             body='This Reside lookup/draft did not complete because a source or model was unavailable. No broader tools or actions were used. Retry request '+event+' for one bounded retry; no completion is claimed.'
             state='error'
         result={'policy':POLICY_DIGEST,'event':event,'state':state,'body':body,
-                'completed':business.now(),'attempt':attempt}
+                'completed':business.now(),'attempt':attempt,'aggregate':aggregate}
         put(p,event,'result-'+str(attempt),result)
         return outcome(p,event)
     finally:_EXECUTION.release()

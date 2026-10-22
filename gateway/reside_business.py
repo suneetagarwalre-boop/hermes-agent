@@ -145,7 +145,7 @@ def webinars(principal, client=None):
     return result
 
 
-def registration_counts(principal, webinar_id, client=None, *, occurrence=None):
+def registration_counts(principal, webinar_id, client=None, *, occurrence=None, expected_event=None):
     """Aggregate only. A page of one is required by Zoom's totals endpoint.
 
     Transport bytes can contain one registrant, but no such fields enter model,
@@ -160,6 +160,15 @@ def registration_counts(principal, webinar_id, client=None, *, occurrence=None):
     detail=client.zoom('/webinars/'+webinar_id)
     if str(detail.get('id'))!=webinar_id or detail.get('host_id')!=ZOOM_HOST:
         raise PermissionError('selected webinar identity drift')
+    if expected_event is not None:
+        # Re-inventory/detail can race a schedule edit. Do not read totals for a
+        # different event/date than the server selected and validated.
+        fields=('id','title','start','type','occurrences')
+        if any(row.get(k)!=expected_event.get(k) for k in fields):
+            raise PermissionError('selected event changed before aggregate read')
+        if (detail.get('topic')!=row['title'] or detail.get('start_time')!=row['start']
+                or detail.get('type')!=row['type']):
+            raise PermissionError('selected event detail changed before aggregate read')
     # Host list responses can omit recurring occurrences. Never mistake that
     # omission for a single event and report a mixed-series registration total.
     if type(detail.get('type')) is not int or detail['type']!=5:
