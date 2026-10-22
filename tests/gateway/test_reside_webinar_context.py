@@ -124,6 +124,73 @@ def test_user_and_model_prose_do_not_create_aggregate_context(principal, source)
     assert source.calls[before:] == []
 
 
+@pytest.mark.parametrize('restriction', [
+    'October 23', 'October 23rd', 'Oct. 23', '10/23/2026', 'October 22, 1999',
+    'October 22 and October 23rd',
+    'October22,1999', 'Oct.23', '10/23', 'October 22, 0000',
+    'October 22, 9999', 'October 22, 19999', 'October 22, 99',
+    'October twenty-third', '23 October 2026', '10.23.2026', '10/22/26',
+    '2026-10-22 and 10.23.2026', 'October 22 and October twenty-third',
+])
+@pytest.mark.parametrize('selector', ['85284217825', 'Stop Chasing Leads Build the Team'])
+def test_review_explicit_date_restrictions_never_fall_back_to_id_or_title(principal, source, selector, restriction):
+    question = f'How many registrations for webinar {selector} on {restriction}?'
+    result = run(principal, source, EVENT, question)
+    assert result['state'] == 'complete'
+    assert 'no registration count' in result['body']
+    assert not any(path.endswith('/registrants') for path, _ in source.calls)
+
+
+@pytest.mark.parametrize('restriction', [
+    'October 22nd', 'Oct. 22', 'Oct.22', '10/22/2026', '10/22',
+    'October22,2026', 'October 22nd, 2026', 'October 22 and 10/22/2026',
+])
+def test_review_supported_date_spellings_preserve_matching(principal, source, restriction):
+    result = run(principal, source, EVENT,
+        f'How many registrations for webinar 85284217825 on {restriction}?')
+    assert result['state'] == 'complete'
+    assert '92 approved registrations' in result['body']
+    totals = [(path, params) for path, params in source.calls if path.endswith('/registrants')]
+    assert len(totals) == 3
+    assert all(path == '/webinars/85284217825/registrants' and params['page_size'] == 1
+        for path, params in totals)
+
+
+@pytest.mark.parametrize('year', ['0001', '1999', '9999'])
+@pytest.mark.parametrize('spelling', ['October 22, {year}', '10/22/{year}'])
+def test_review_four_digit_year_is_a_constraint_not_a_current_century_filter(principal, source, year, spelling):
+    source.row['start_time'] = f'{year}-10-22T17:00:00Z'
+    result = run(principal, source, EVENT,
+        'How many registrations for webinar 85284217825 on ' + spelling.format(year=year) + '?')
+    assert '92 approved registrations' in result['body']
+    assert len([path for path, _ in source.calls if path.endswith('/registrants')]) == 3
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('extra', ['', ' webinar 85284217825'])
+def test_review_multiple_explicit_titles_cannot_choose_largest_overlap(principal, source, reverse, extra):
+    second = dict(source.row, id=85284217826, topic='Growth Stack')
+    source.page['webinars'].append(second)
+    if reverse:
+        source.page['webinars'].reverse()
+    question = ('How many registrations for webinar Stop Chasing Leads Build the Team '
+        'That Converts Them and Growth Stack on October 22?' + extra)
+    result = run(principal, source, EVENT, question)
+    assert result['state'] == 'complete'
+    assert 'no registration count' in result['body']
+    assert not any(path.endswith('/registrants') for path, _ in source.calls)
+
+
+def test_review_single_explicit_title_still_matches_among_multiple_events(principal, source):
+    source.page['webinars'] = [dict(source.row), dict(source.row, id=85284217826, topic='Growth Stack')]
+    source.row.update(id=85284217826, topic='Growth Stack')
+    result = run(principal, source, EVENT,
+        'How many registrations for webinar Growth Stack on October 22?')
+    assert '92 approved registrations' in result['body']
+    assert all(path == '/webinars/85284217826/registrants'
+        for path, _ in source.calls if path.endswith('/registrants'))
+
+
 def test_detail_date_drift_stops_before_totals(principal, source):
     original = source.zoom
     def changed(path, params=None):
