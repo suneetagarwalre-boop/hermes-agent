@@ -145,7 +145,7 @@ def webinars(principal, client=None):
     return result
 
 
-def registration_counts(principal, webinar_id, client=None, *, occurrence=None):
+def registration_counts(principal, webinar_id, client=None, *, occurrence=None, expected=None):
     """Aggregate only. A page of one is required by Zoom's totals endpoint.
 
     Transport bytes can contain one registrant, but no such fields enter model,
@@ -157,9 +157,13 @@ def registration_counts(principal, webinar_id, client=None, *, occurrence=None):
     if webinar_id not in approved:
         raise PermissionError('unknown Reside webinar')
     row = approved[webinar_id]
+    if expected is not None and row != expected:
+        raise PermissionError('selected webinar changed before totals')
     detail=client.zoom('/webinars/'+webinar_id)
     if str(detail.get('id'))!=webinar_id or detail.get('host_id')!=ZOOM_HOST:
         raise PermissionError('selected webinar identity drift')
+    if detail.get('start_time')!=row['start'] or detail.get('topic')!=row['title']:
+        raise PermissionError('selected webinar title/date drift')
     # Host list responses can omit recurring occurrences. Never mistake that
     # omission for a single event and report a mixed-series registration total.
     if type(detail.get('type')) is not int or detail['type']!=5:
