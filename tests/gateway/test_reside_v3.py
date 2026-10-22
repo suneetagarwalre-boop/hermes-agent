@@ -185,6 +185,7 @@ def test_duplicate_restart_and_bounded_retry(principal,source):
     assert len(source.calls)==calls
     with pytest.raises(PermissionError):app.claim(principal,EVENT,'Different request')
     with pytest.raises(PermissionError):app.outcome(replace(principal,channel='1562553216045158523'),EVENT)
+    app.claim(principal,EVENT+'0',QUESTION)
     with pytest.raises(PermissionError):app.execute(principal,EVENT+'0',retry=True,client=source)
 
 

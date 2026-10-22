@@ -54,7 +54,17 @@ def addressed(adapter,message,p):
     if message.mentions:return False
     key=(p.user,p.channel)
     opened=getattr(adapter,'_reside_v3_conversations',{}).get(key,0)
-    return asyncio.get_running_loop().time()-opened < 300
+    return (opened>0 and asyncio.get_running_loop().time()-opened < 300) or bool(app.recent(p))
+
+
+async def reply_target(adapter,message,p):
+    ref=getattr(message,'reference',None)
+    if (ref is None or not getattr(ref,'message_id',None)
+            or str(getattr(ref,'channel_id',''))!=p.channel):return False
+    try:
+        source=await asyncio.wait_for(message.channel.fetch_message(ref.message_id),SEND_TIMEOUT)
+        return str(source.author.id)==scope.BOT and str(source.channel.id)==p.channel
+    except Exception:return False
 
 
 def _content(adapter,body):
@@ -144,7 +154,7 @@ async def _run(adapter,message,p):
     else:unsupported=False
     try:app.claim(p,str(message.id),text)
     except (ValueError,PermissionError):
-        await safe_notice(adapter,message,p,'unsupported');return
+        await _notice_once(adapter,message,p,'unsupported');return
     if unsupported:
         await _notice_once(adapter,message,p,'unsupported');return
     await _notice_once(adapter,message,p,'received')
@@ -188,7 +198,15 @@ async def handle(adapter,message):
     p=principal(adapter,message)
     if (p.user!=scope.JEFF or p.bot!=scope.BOT or p.home!=scope.HOME or p.is_bot):return
     if message.type not in {discord.MessageType.default,discord.MessageType.reply}:return
-    if not addressed(adapter,message,p):return
+    # Authorize the resource context before consulting any durable followup state.
+    try:p.authorize()
+    except PermissionError:
+        if adapter._self_is_raw_mentioned(message):
+            if not adapter._dedup.is_duplicate(str(message.id)):
+                try:await safe_notice(adapter,message,p,'not_allowed')
+                except Exception:logger.warning('Reside V3 room notice failed event=%s',message.id)
+        return
+    if not addressed(adapter,message,p) and not await reply_target(adapter,message,p):return
     try:
         p.authorize()
         allowed,ignored=adapter._get_allowed_channels(),adapter._get_ignored_channels()

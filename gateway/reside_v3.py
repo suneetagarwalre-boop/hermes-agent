@@ -146,6 +146,29 @@ def outcome(p,event):
     return None
 
 
+def recent(p,before=None):
+    """Only this principal+room's recent completed V3 turns; no owner backfill."""
+    from datetime import UTC,datetime
+    fd=v2._folder(p)
+    try:
+        names=[n for n in os.listdir(fd) if re.fullmatch(r'v3-[0-9]{15,22}\.request\.json',n)]
+        names.sort(key=lambda n:int(n.split('.')[0][3:]),reverse=True)
+        history=[]
+        for name in names[:100]:
+            event=name.split('.')[0][3:]
+            if before is not None and int(event)>=int(before):continue
+            stored=v2._read(fd,name)
+            if stored['principal']!=_context(p) or stored['policy']!=POLICY_DIGEST:continue
+            age=(datetime.now(UTC)-datetime.fromisoformat(stored['created'])).total_seconds()
+            if not 0<=age<=300:continue
+            result=outcome(p,event)
+            if result is None or result['state']!='complete':continue
+            history.append({'question':stored['question'],'answer':result['body'][:2500]})
+            if len(history)==2:break
+        return list(reversed(history))
+    finally:os.close(fd)
+
+
 def _webinar_match(text,rows):
     """Natural input filters only an already-authorized host inventory."""
     ids=set(re.findall(r'\b[0-9]{9,12}\b',text))
@@ -203,12 +226,12 @@ def _parse(raw,ids):
     return value
 
 
-def synthesize(p,text,*,client=None,complete=None):
+def synthesize(p,text,*,client=None,complete=None,history=()):
     p.authorize()
-    docs=business.documents(p,text,client)
+    docs=business.documents(p,text+' '+ ' '.join(h['question'] for h in history),client)
     facts=projection()+docs['documents']
     ids={r['id'] for r in facts}
-    content={'question':text,'verified_evidence':facts,'unavailable_sources':docs['unavailable'],
+    content={'question':text,'own_recent_context':history,'verified_evidence':facts,'unavailable_sources':docs['unavailable'],
              'available_document_titles':docs['catalog']}
     # Not an unrestricted chat agent: no skills, backfill, sessions or tool schema.
     answer=_parse((complete or v2.model_response)([{'role':'system','content':SYSTEM},
@@ -250,7 +273,7 @@ def execute(p,event,*,retry=False,client=None,complete=None):
             elif PROTECTED.search(text):body=DENIED
             elif re.search(r'\b(?:registrations?|registered|registrants?|registration number)\b',text,re.IGNORECASE) and re.search(r'\bwebinar\b',text,re.IGNORECASE):
                 body=registration_answer(p,text,client)
-            else:body=synthesize(p,text,client=client,complete=complete)
+            else:body=synthesize(p,text,client=client,complete=complete,history=recent(p,event))
             state='complete'
         except Exception:
             body='This Reside lookup/draft did not complete because a source or model was unavailable. No broader tools or actions were used. Retry request '+event+' for one bounded retry; no completion is claimed.'
