@@ -20,7 +20,7 @@ from gateway import reside_scope as scope
 from gateway.reside_corpus import projection
 
 ROOMS = frozenset((scope.ROOM, '1562553216045158523', '1562916299007463587'))
-POLICY = 'reside-business-v3.1'
+POLICY = 'reside-business-v3.2'
 logger=logging.getLogger(__name__)
 CAPABILITIES = ('reside_webinar_aggregates_read','reviewed_reside_documents_read',
                 'internal_analysis','internal_draft','fixed_work_product_execution')
@@ -148,7 +148,7 @@ def claim(p,event,text):
     p.authorize()
     text=v2.validate_text(text)
     request={'principal':_context(p),'event':event,'question':text,'policy':POLICY_DIGEST,
-        'capabilities':list(CAPABILITIES),'created':business.now()}
+        'capabilities':list(CAPABILITIES),'executor':executor_for(text),'created':business.now()}
     try:
         existing=get(p,event,'request')
     except FileNotFoundError:
@@ -159,14 +159,15 @@ def claim(p,event,text):
             except FileExistsError: return claim(p,event,text)
         finally: os.close(fd)
         return True
-    if any(existing[k]!=request[k] for k in ('principal','event','question','policy','capabilities')):
+    if any(existing[k]!=request[k] for k in ('principal','event','question','policy','capabilities','executor')):
         raise PermissionError('request binding mismatch')
     return False
 
 
 def request(p,event):
     stored=get(p,event,'request')
-    if stored['principal']!=_context(p) or stored['policy']!=POLICY_DIGEST or stored['capabilities']!=list(CAPABILITIES):
+    if (stored['principal']!=_context(p) or stored['policy']!=POLICY_DIGEST
+            or stored['capabilities']!=list(CAPABILITIES) or stored.get('executor')!=executor_for(stored['question'])):
         raise PermissionError('immutable request ceiling mismatch')
     return stored
 
@@ -283,6 +284,11 @@ def _parse(raw,ids):
     return value
 
 
+def executor_for(text):
+    if not v2.TASK_INTENT.search(text):return 'analysis'
+    return 'report' if re.search(r'\b(?:report|analysis|analyze|compare)\b',text,re.IGNORECASE) else 'draft'
+
+
 def synthesize(p,text,*,client=None,complete=None,history=()):
     p.authorize()
     docs=business.documents(p,text+' '+ ' '.join(h['question'] for h in history),client)
@@ -291,11 +297,15 @@ def synthesize(p,text,*,client=None,complete=None,history=()):
     content={'question':text,'own_recent_context':history,'verified_evidence':facts,'unavailable_sources':docs['unavailable'],
              'available_document_titles':docs['catalog']}
     # Not an unrestricted chat agent: no skills, backfill, sessions or tool schema.
-    answer=_parse((complete or v2.model_response)([{'role':'system','content':SYSTEM},
+    executor=executor_for(text)
+    system=SYSTEM
+    if executor!='analysis':
+        system+='\nSERVER-SELECTED FIXED EXECUTOR: '+executor+'. Produce the COMPLETE '+executor+' work product NOW. Do NOT return a task specification, proposed assignment, future work plan, or empty receipt. Use kind '+executor+'. Report documented findings, unknown live facts and missing evidence honestly; no unperformed inspection may be claimed.'
+    answer=_parse((complete or v2.model_response)([{'role':'system','content':system},
         {'role':'user','content':json.dumps(content)}]),ids)
     if answer['kind']=='deny':return DENIED
     coordinated=v2.TASK_INTENT.search(text) is not None
-    if coordinated and answer['kind'] not in {'report','draft','coordinate_report','coordinate_draft'}:
+    if coordinated and answer['kind'] not in {executor,'coordinate_'+executor}:
         raise PermissionError('fixed work-product executor requires report or draft')
     heading='Internal WORKING DRAFT — not approved or sent' if 'draft' in answer['kind'] else 'Reside source-backed analysis'
     refs={r['id']:r for r in facts}

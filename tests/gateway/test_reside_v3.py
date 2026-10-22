@@ -334,7 +334,7 @@ async def test_lost_delivery_ack_not_blindly_resent(live,source,monkeypatch):
 ])
 def test_registration_form_and_negated_send_are_real_drafts_not_count_route(principal,source,question):
     app.claim(principal,EVENT,question)
-    model=Mock(return_value=json.dumps({'kind':'draft','body':'Internal checklist: verify the form, host and approval evidence.','sources':['context']}))
+    model=Mock(return_value=json.dumps({'kind':'report' if 'report' in question else 'draft','body':'Internal checklist: verify the form, host and approval evidence.','sources':['context']}))
     result=app.execute(principal,EVENT,client=source,complete=model)
     assert result['state']=='complete' and 'verify the form' in result['body']
     model.assert_called_once()
@@ -523,3 +523,12 @@ def test_recurring_type_or_omitted_occurrences_never_becomes_single_count(princi
     source.row['type']=kind
     with pytest.raises(ValueError):business.registration_counts(principal,'85284217825',source)
     assert all(not p.endswith('/registrants') for p,_ in source.calls)
+
+
+def test_fixed_report_executor_is_server_selected_not_model_downgraded(principal,source):
+    question='Create a task to produce a webinar QA report'
+    app.claim(principal,EVENT,question)
+    assert app.request(principal,EVENT)['executor']=='report'
+    with pytest.raises(PermissionError):
+        app.synthesize(principal,question,client=source,complete=lambda m:json.dumps(
+            {'kind':'draft','body':'Task proposal only','sources':['doc:approvedDoc']}))
