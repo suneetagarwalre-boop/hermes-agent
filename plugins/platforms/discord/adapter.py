@@ -1789,6 +1789,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         Never fall back to owner tools on any failure. No shared-room business
         output: the only dynamic response goes to the authenticated user's DM.
         """
+        if self.config.extra.get("reside_scoped_ops_v3") is True:
+            from gateway.reside_transport import handle
+            await handle(self, message)
+            return
         from gateway import reside_scope as scope
         if self.config.extra.get("reside_scoped_ops") is not True:
             return
@@ -1872,6 +1876,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
         if self._is_reside_restricted_sender(str(getattr(message.author, "id", ""))):
+            if self.config.extra.get("reside_scoped_ops_v3") is True:
+                await self._handle_reside_scoped(message)
+                return False
             if not self._dedup.is_duplicate(str(message.id)):
                 if self.config.extra.get("reside_scoped_ops") is True:
                     await self._handle_reside_scoped(message)
@@ -2733,6 +2740,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         # Scoped operations are live-request only; recovery never replays reads,
         # private replies or proposal writes, and cannot enter the owner agent.
         if self._is_reside_restricted_sender(str(getattr(message.author, "id", ""))):
+            if self.config.extra.get("reside_scoped_ops_v3") is True:
+                from gateway.reside_transport import handle
+                await handle(self, message)
             return False
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
@@ -7637,7 +7647,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops", "reside_scoped_ops_v2"):
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops", "reside_scoped_ops_v2", "reside_scoped_ops_v3"):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:
