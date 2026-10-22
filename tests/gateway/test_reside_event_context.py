@@ -147,6 +147,88 @@ def test_followup_cannot_widen_id_account_or_bypass_new_date(principal, source):
     assert not registrants(source)
 
 
+@pytest.fixture
+def two_events(source):
+    source.row['start_time'] = '2026-10-19T17:00:00Z'
+    other = copy.deepcopy(source.row)
+    other.update(id=85284217826, topic='Recruiting Systems Leadership Workshop',
+                 start_time='2026-10-22T17:00:00Z')
+    source.page['webinars'].append(other)
+    original = source.zoom
+    def zoom(path, params=None):
+        if path == '/webinars/85284217826':
+            source.calls.append((path, params))
+            return copy.deepcopy(other)
+        return original(path, params)
+    source.zoom = zoom
+    return source
+
+
+@pytest.mark.parametrize('followup', [
+    'How many now today?',
+    'How many now October 22?',
+    'How many now 2026-10-22?',
+    'How many now for Recruiting Systems Leadership Workshop?',
+    'How many now for webinar 85284217826 today?',
+])
+def test_contextual_selectors_cannot_switch_selected_event(principal, two_events, followup):
+    source = two_events
+    app.claim(principal, EVENT, 'How many registrations for webinar 85284217825 October 19?')
+    first = app.execute(principal, EVENT, client=source)
+    assert first['state'] == 'complete'
+    assert first['aggregate']['id'] == '85284217825'
+    source.calls.clear()
+    event = str(int(EVENT) + 1)
+    app.claim(principal, event, followup)
+    model = Mock(side_effect=AssertionError('contextual aggregate must not enter model'))
+    result = app.execute(principal, event, client=source, complete=model)
+    assert result['state'] == 'complete'
+    assert 'Which Reside webinar/date?' in result['body']
+    assert result['aggregate'] is None
+    assert not registrants(source)
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize('question,selected', [
+    ('How many now October 19?', '85284217825'),
+    ('How many registrations for webinar 85284217826 today?', '85284217826'),
+])
+def test_matching_contextual_date_and_explicit_new_query_controls(principal, two_events, question, selected):
+    source = two_events
+    app.claim(principal, EVENT, 'How many registrations for webinar 85284217825 October 19?')
+    assert app.execute(principal, EVENT, client=source)['aggregate']['id'] == '85284217825'
+    source.calls.clear()
+    event = str(int(EVENT) + 1)
+    app.claim(principal, event, question)
+    model = Mock(side_effect=AssertionError('aggregate must not enter model'))
+    result = app.execute(principal, event, client=source, complete=model)
+    assert result['state'] == 'complete'
+    assert '92 approved registrations' in result['body']
+    assert result['aggregate']['id'] == selected
+    assert registrants(source) == [f'/webinars/{selected}/registrants'] * 3
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize('status', ['approved', 'pending', 'denied'])
+@pytest.mark.parametrize('date', ['today', 'tomorrow'])
+def test_status_qualified_id_queries_still_intersect_dates(principal, source, status, date):
+    question = f'How many {status} registrations for webinar 85284217825 {date}?'
+    app.claim(principal, EVENT, question)
+    model = Mock(side_effect=AssertionError('status aggregate must not enter model'))
+    result = app.execute(principal, EVENT, client=source, complete=model)
+    assert result['state'] == 'complete'
+    if date == 'today':
+        assert '92 approved registrations' in result['body']
+        assert 'Pending: 0; denied: 0' in result['body']
+        assert result['aggregate']['id'] == '85284217825'
+        assert registrants(source) == ['/webinars/85284217825/registrants'] * 3
+    else:
+        assert 'Which Reside webinar/date?' in result['body']
+        assert result['aggregate'] is None
+        assert not registrants(source)
+    model.assert_not_called()
+
+
 def test_detail_schedule_drift_stops_before_totals(principal, source):
     original = source.zoom
     def drift(path, params=None):

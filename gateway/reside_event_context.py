@@ -12,7 +12,7 @@ _WORDS = re.compile(r'[a-z]{3,}')
 _STOP = set(('the for have has webinar registered registration registrations registrants people '
              'how many what which happening number count total october oct tomorrow today reside '
              'and now current currently updated please give tell about this that event its with '
-             'are get can you does our date scheduled happening on').split())
+             'are get can you does our date scheduled happening on approved pending denied').split())
 _STOP.update(m.lower() for m in ('January February March April May June July August September October November December').split())
 _STOP.update(_MONTH_INDEX)
 FOLLOWUP = re.compile(r'^(?:(?:and\s+)?(?:now|currently)|(?:how\s+many|what(?:\s+is|[’\x27]s)?\s+(?:the\s+)?(?:registration\s+)?(?:count|total|number))(?:\s+.*)?)\s*[?.!]*$', re.IGNORECASE)
@@ -62,6 +62,9 @@ def match(text, rows, now, fallback_id=None):
         return None
     candidates = []
     for row in rows:
+        # Context is a binding selection, not a default another selector can replace.
+        if fallback_id is not None and row['id'] != fallback_id:
+            continue
         if ids and row['id'] not in ids:
             continue
         if words and scores[row['id']] != best:
