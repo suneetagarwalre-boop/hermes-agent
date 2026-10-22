@@ -6,6 +6,7 @@ reconciles only the requesting profile's MCP servers; ``file.attach`` stages for
 """
 import asyncio
 from functools import partial
+from pathlib import Path
 import sys
 
 from gateway.session_busy_controls import authorize
@@ -202,9 +203,11 @@ async def read(connection, ref, params, *, kind):
     authorize(connection, ref, params, 'session:read')
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
-        _require_current_route(authority, ref)
         if kind == 'control':
+            # Persisted per session id, never the route's live objects: readable after a messaging
+            # route moved on to another conversation.
             return {'control': control_snapshot(authority, ref)}
+        _require_current_route(authority, ref)
         agent, records = _owner_objects(authority, ref, include_fallback_evicted=kind == 'subagents')
         if kind == 'subagents':
             return {'subagents': [{key: record.get(key) for key in _SUBAGENT_FIELDS}
@@ -251,7 +254,12 @@ async def kill_process(connection, ref, params):
 async def reload_mcp(connection, ref, params):
     """Desktop's MCP add / toggle / repair: bring THIS profile's live MCP servers in step with its
     config (the owner's housekeeping reconcile, run now) and refresh this profile's cached agents.
-    Never the sidecar's teardown of every server, which cut every chat's in-flight MCP calls."""
+    Never the sidecar's teardown of every server, which cut every chat's in-flight MCP calls. The calling
+    session's MCP servers then change as a new policy generation when it is idle (``session``: applied,
+    unchanged or busy); other sessions take theirs when next attached. A configured server that did not
+    connect is named: a refusal when nothing took effect (no server registered or removed, no session
+    generation), else ``unavailable`` beside the success. A call naming ``rev``, the revision the session
+    already holds, is that same nothing-left-to-load, answered as success with ``loaded_rev``."""
     if set(params) - {'session_id', 'confirm', 'rev', 'profile'}:
         raise RuntimeStoreError('invalid_params')
     if 'session:control' not in connection.actor.capabilities:
@@ -259,18 +267,90 @@ async def reload_mcp(connection, ref, params):
     if params.get('confirm') is not True:
         return {'status': 'confirm_required', 'message': 'Reloading MCP refreshes every chat of this profile.'}
     from tools.mcp_oauth import suppress_interactive_oauth
-    from tools.mcp_tool_discovery import reconcile_mcp_servers_with_config
+    from tools import mcp_tool_discovery as discovery
 
     def reconcile():
         with suppress_interactive_oauth():
-            return reconcile_mcp_servers_with_config()
-    result = await asyncio.to_thread(reconcile)
+            return (discovery.reconcile_mcp_servers_with_config(), discovery.mcp_servers_not_connected(),
+                    discovery.mcp_servers_ready())
+    result, failed, ready = await asyncio.to_thread(reconcile)
+    # ``added`` is what reconcile attempted: only those now registered (live or lazy) changed anything.
+    result = {**result, 'added': [name for name in result.get('added', []) if name not in failed]}
     from gateway.session_authorities import served_profile_name
     runner = connection.authority.runner
     multiplex = bool(getattr(runner.config, 'multiplex_profiles', False))
     runner._mcp_reload_refresh_cached_agents(multiplex, served_profile_name(connection.authority.profile_id))
+    session = await _commit_session_mcp(connection, ref, params)
+    held_rev = await _held_mcp_rev(connection, ref) if params.get('rev') else ''
+    # Refuse only a reload whose own work did not take effect: a call that names the revision the session
+    # already holds has nothing left to load, and refusing it leaves a client that acknowledges on
+    # ``reloaded`` retrying a parked server at poll rate with no way to close the handshake (#141769).
+    if (failed and session != 'applied' and not (result.get('removed') or result['added'])
+            and params.get('rev') != held_rev):
+        raise RuntimeStoreError('mcp_servers_unavailable', field='mcp_servers',
+                                detail=f'did not connect: {", ".join(failed)}')
     changed = ', '.join(f'{k}: {", ".join(v)}' for k, v in result.items() if v) or 'no server changes'
-    return {'status': 'reloaded', 'message': f'MCP servers reconciled ({changed})'}
+    note = {'applied': '; this chat\'s tools changed for its next turn',
+            'busy': '; this chat is busy: its new tools apply once the turn finishes and reload runs again '
+                    'or the chat is reopened'}.get(session or '', '')
+    unavailable = f'; did not connect: {", ".join(failed)}' if failed else ''
+    selected = {'session_servers': await asyncio.to_thread(_session_servers, connection.authority, ref.session_id,
+                                                           ready)} if session else {}
+    return {'status': 'reloaded', 'message': f'MCP servers reconciled ({changed}){note}{unavailable}',
+            **({'loaded_rev': held_rev} if held_rev else {}),
+            **({'session': session} if session else {}), **({'unavailable': failed} if failed else {}), **selected}
+
+
+async def _held_mcp_rev(connection, ref):
+    """The ``mcp_rev`` this session's committed policy already holds — the value ``config.get mtime`` shipped
+    the client — or ``''`` when the call names no live local session. The policy is read on the loop (it
+    walks ``authority.sessions`` and the adapter's maps, which only the loop mutates); only the config read
+    and hash go to a worker thread."""
+    sid = getattr(ref, 'session_id', None)
+    live = connection.authority.sessions.get(sid) if sid else None
+    if live is None or live.source is None:
+        return ''
+    from gateway.session_policy import policy_for_source
+    policy = policy_for_source(connection.authority.runner, live.source)
+    return await asyncio.to_thread(_mcp_revision_in_scope, Path(connection.authority.profile_id), policy)
+
+
+def _mcp_revision_in_scope(home, policy):
+    from gateway.run import _profile_runtime_scope
+    from gateway.session_config import mcp_revision
+    from hermes_cli.config import load_config
+    with _profile_runtime_scope(home):
+        return mcp_revision(policy, load_config())
+
+
+def _session_servers(authority, sid, ready):
+    """The profile MCP servers the session's committed policy runs (its toolsets name them) that are *ready*
+    (live or lazy): a server connected for the profile is not one a chat with ``no_mcp``, an explicit pick or
+    a platform allowlist enabled, and one the policy names but that parked serves the chat nothing."""
+    import json
+    from gateway.session_policy import restore_policy
+    from hermes_cli.tools_config import enabled_mcp_server_names
+    from hermes_state_local import local_receipt
+    policy = restore_policy(local_receipt(authority.db, sid)['policy'])
+    return sorted(set(policy.toolsets) & enabled_mcp_server_names(json.loads(policy.config_json)) & set(ready))
+
+
+async def _commit_session_mcp(connection, ref, params):
+    """The calling local session's MCP servers as a gateway-committed generation (``commit_refresh``):
+    never a running or queued turn's, never another session's."""
+    from gateway.config import Platform
+    authority, sid = connection.authority, getattr(ref, 'session_id', None)
+    live = authority.sessions.get(sid) if sid else None
+    if live is None or live.source is None or live.source.platform != Platform.LOCAL:
+        return None
+    authorize(connection, ref, params, 'session:control')
+    from gateway.session_policy_refresh import commit_refresh
+    try:
+        return 'applied' if await commit_refresh(authority, ref, mcp_only=True) else 'unchanged'
+    except RuntimeStoreError as exc:
+        if exc.reason not in {'session_busy', 'unknown_execution', 'revision_conflict'}:
+            raise
+        return 'busy'
 
 
 async def stop_processes(connection, ref, params):
@@ -346,7 +426,9 @@ def control_snapshot(authority, ref):
         _safe_goal_snapshot, _safe_loop_snapshot, _safe_heartbeat_snapshot,
         _snapshot_revision, _snapshot_updated_at,
     )
+    # Compression carries goal/loop/heartbeat to the continuation: read the current segment.
     target = physical_target(authority, ref)
+    target = authority.db.get_compression_tip(target) or target
     states = []
     for kind, cls in [('goal', GoalState), ('loop', LoopState), ('heartbeat', HeartbeatState)]:
         raw = authority.db.get_meta(kind + ':' + target)
@@ -401,10 +483,23 @@ def subagent_records(parent, session_id=None, *, session_db=None, route=None, in
     # A rotating /compress moves the conversation to a new stored id; an evicted parent keeps its earlier one.
     target_sids = _compression_lineage(expected_db, target_sid)
     with registry._active_subagents_lock:
-        # Deliberately no unconditional durable-ID fallback: only a parent evicted by this session's own fallback keeps its children visible in the read-only roster.
         return [dict(record) for record in registry._active_subagents.values()
                 if (parent is not None and registry._is_descendant_of(record.get('agent'), parent))
-                or _has_fallback_evicted_ancestor(record.get('agent'), target_sids, expected_db, effective_route, registry)]
+                or _has_fallback_evicted_ancestor(record.get('agent'), target_sids, expected_db, effective_route, registry)
+                or _owned_by_lineage(record, target_sids, expected_db)]
+
+
+def _owned_by_lineage(record, target_sids, expected_db):
+    """The read-only roster follows the conversation, as ``delegate_task(action="list")`` does: a
+    child whose durable owner id is in this session's compression lineage, written to the same
+    session database file. Without it every cached-agent rebuild (``/reasoning``, ``/model``, a
+    policy refresh, idle eviction) hid still-running children from the dock while the status bar
+    kept counting them. Control and tail stay pinned to the resident parent."""
+    if not target_sids or record.get('owner_agent_session_id') not in target_sids:
+        return False
+    expected_path = getattr(expected_db, 'db_path', None)
+    child_path = getattr(getattr(record.get('agent'), '_session_db', None), 'db_path', None)
+    return expected_path is not None and child_path is not None and str(child_path) == str(expected_path)
 
 
 def _compression_lineage(db, session_id):
