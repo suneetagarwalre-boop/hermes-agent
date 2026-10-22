@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -20,6 +21,7 @@ from gateway.reside_corpus import projection
 
 ROOMS = frozenset((scope.ROOM, '1562553216045158523', '1562916299007463587'))
 POLICY = 'reside-business-v3.1'
+logger=logging.getLogger(__name__)
 CAPABILITIES = ('reside_webinar_aggregates_read','reviewed_reside_documents_read',
                 'internal_analysis','internal_draft','fixed_work_product_execution')
 POLICY_DIGEST = hashlib.sha256(json.dumps([POLICY, sorted(ROOMS), CAPABILITIES,
@@ -244,7 +246,7 @@ def registration_answer(p,text,client=None):
     return (f"{count['approved']} approved registrations for {count['title']}.\n"
         f"Pending: {count['pending']}; denied: {count['denied']}. Counts are separate statuses, not an attendance total.\n"
         f"Scheduled: {count['start']}; Zoom webinar {count['id']}; host {count['host']}.\n"
-        f"Verified {count['as_of']} from Zoom registration total_records (read-only). No registrant names or contact list retrieved into this assistant.")
+        f"Verified {count['as_of']} from Zoom registration total_records (read-only). Only aggregate counts are retained/disclosed; no registrant names enter the model or output.")
 
 
 def _parse(raw,ids):
@@ -277,6 +279,8 @@ def synthesize(p,text,*,client=None,complete=None,history=()):
         {'role':'user','content':json.dumps(content)}]),ids)
     if answer['kind']=='deny':return DENIED
     coordinated=v2.TASK_INTENT.search(text) is not None
+    if coordinated and answer['kind'] not in {'report','draft','coordinate_report','coordinate_draft'}:
+        raise PermissionError('fixed work-product executor requires report or draft')
     heading='Internal WORKING DRAFT — not approved or sent' if 'draft' in answer['kind'] else 'Reside source-backed analysis'
     refs={r['id']:r for r in facts}
     links=[]
@@ -310,6 +314,8 @@ def execute(p,event,*,retry=False,client=None,complete=None):
         try:
             if text.lower() in ('help','reside','reside help','what can you do?'):body=HELP
             elif PROTECTED.search(text) or DIRECT_ACTION.search(text):body=DENIED
+            elif text.lower() in ('reside report','reside lookup automation-health'):
+                body=scope.automation_report(p,v2.profile_monday_token(p))
             elif (not v2.TASK_INTENT.search(text)
                   and re.search(r'\b(?:how many|number|count|total|registered for)\b',text,re.IGNORECASE)
                   and re.search(r'\b(?:registrations?|registered|registrants?)\b',text,re.IGNORECASE)
@@ -317,7 +323,11 @@ def execute(p,event,*,retry=False,client=None,complete=None):
                 body=registration_answer(p,text,client)
             else:body=synthesize(p,text,client=client,complete=complete,history=recent(p,event))
             state='complete'
-        except Exception:
+        except Exception as exc:
+            reason=('verification_denied' if isinstance(exc,PermissionError) else
+                    'timeout' if isinstance(exc,TimeoutError) else
+                    'invalid_source_or_model_shape' if isinstance(exc,ValueError) else 'source_or_model_unavailable')
+            logger.warning('Reside V3 executor failed event=%s attempt=%s reason=%s agent_dispatch=false',event,attempt,reason)
             body='This Reside lookup/draft did not complete because a source or model was unavailable. No broader tools or actions were used. Retry request '+event+' for one bounded retry; no completion is claimed.'
             state='error'
         result={'policy':POLICY_DIGEST,'event':event,'state':state,'body':body,

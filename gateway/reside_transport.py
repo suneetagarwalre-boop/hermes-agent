@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 from datetime import UTC, datetime
 
@@ -195,7 +196,7 @@ async def _run(adapter,message,p):
         await _notice_once(adapter,message,p,'error')
 
 
-async def handle(adapter,message):
+async def _handle(adapter,message):
     """Exact restricted ingress. Always consumed; NEVER normal-agent fallback."""
     p=principal(adapter,message)
     if (p.user!=scope.JEFF or p.bot!=scope.BOT or p.home!=scope.HOME or p.is_bot):return
@@ -221,6 +222,8 @@ async def handle(adapter,message):
         return
     if adapter.config.extra.get('reside_scoped_ops_v3') is not True:
         await safe_notice(adapter,message,p,'config');return
+    logger.info('Reside V3 admitted event=%s profile=hermesdiscord pid=%s policy=%s policy_digest=%s agent_dispatch=false',
+        message.id,os.getpid(),app.POLICY,app.POLICY_DIGEST)
     conversations=getattr(adapter,'_reside_v3_conversations',None)
     if conversations is None:conversations={};adapter._reside_v3_conversations=conversations
     conversations[p.user,p.channel]=asyncio.get_running_loop().time()
@@ -235,3 +238,17 @@ async def handle(adapter,message):
         # Queued, previously receipted requests still need initial execution. The
         # persisted attempt marker (not whether request was inserted) owns that.
         await _run(adapter,message,p)
+
+
+async def handle(adapter,message):
+    """Error barrier consumes restricted ingress, never an owner-agent fallback."""
+    try:await _handle(adapter,message)
+    except Exception:
+        logger.warning('Reside V3 ingress failed event=%s reason=policy_or_storage agent_dispatch=false',getattr(message,'id','unknown'))
+        try:
+            p=principal(adapter,message)
+            if (p.home==scope.HOME and p.user==scope.JEFF and p.bot==scope.BOT and not p.is_bot
+                    and not adapter._dedup.is_duplicate(str(message.id))):
+                await safe_notice(adapter,message,p,'error')
+        except Exception:
+            logger.warning('Reside V3 failure receipt unavailable; operator intervention required')

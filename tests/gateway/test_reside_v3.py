@@ -427,3 +427,92 @@ async def test_send_forbidden_has_actionable_private_destination_error(live,sour
     dm.send.side_effect=discord.Forbidden(SimpleNamespace(status=403,reason='Forbidden'),'DM forbidden')
     await live._dispatch_discord_message(m)
     assert 'Enable DMs' in m.channel.send.await_args.kwargs['content']
+
+
+@pytest.mark.asyncio
+async def test_queued_second_request_is_receipted_and_actually_executed(live,source,monkeypatch):
+    import threading
+    first,dm1=make(live)
+    second,dm2=make(live,event='1562641484979900538')
+    started=asyncio.Event();receipted=asyncio.Event();release=threading.Event()
+    loop=asyncio.get_running_loop();original=app.execute
+    def execute(p,event):
+        if event==EVENT:
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+        return original(p,event,client=source)
+    async def notice(**kw):
+        receipted.set();return SimpleNamespace(id=33)
+    second.channel.send.side_effect=notice
+    monkeypatch.setattr(app,'execute',execute)
+    one=asyncio.create_task(live._dispatch_discord_message(first))
+    await asyncio.wait_for(started.wait(),3)
+    two=asyncio.create_task(live._dispatch_discord_message(second))
+    await asyncio.wait_for(receipted.wait(),3)
+    release.set()
+    await asyncio.gather(one,two)
+    assert any('92 approved' in c.kwargs['content'] for c in dm1.send.await_args_list)
+    assert any('92 approved' in c.kwargs['content'] for c in dm2.send.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_partial_send_reconciles_known_nonce_without_duplicate(live,source,monkeypatch):
+    m,dm=make(live)
+    original=app.execute
+    monkeypatch.setattr(app,'execute',lambda p,e,**kw:original(p,e,client=source))
+    dm.send.side_effect=RuntimeError('ACK_LOST')
+    await live._dispatch_discord_message(m)
+    nonce=dm.send.await_args.kwargs['nonce']
+    async def found():
+        yield SimpleNamespace(id=1562641484979900598,nonce=nonce,author=live._client.user)
+    dm.history=lambda **kw:found()
+    await live._dispatch_discord_message(m)
+    assert dm.send.await_count==1
+    assert 'was delivered' in m.channel.send.await_args.kwargs['content']
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_gets_one_safe_error_and_no_agent(live,monkeypatch):
+    m,dm=make(live)
+    monkeypatch.setattr(app,'claim',Mock(side_effect=OSError('PRIVATE_FILESYSTEM_DETAIL')))
+    await live._dispatch_discord_message(m)
+    await live._dispatch_discord_message(m)
+    assert m.channel.send.await_count==1
+    assert 'PRIVATE_' not in m.channel.send.await_args.kwargs['content']
+    live._handle_message.assert_not_awaited();dm.send.assert_not_awaited()
+
+
+def test_immutable_capability_envelope_rechecked_before_execution(principal,source):
+    app.claim(principal,EVENT,'Create a task to draft webinar SOP')
+    path=principal.home/'reside-scoped/tasks-v2'/('v3-'+EVENT+'.request.json')
+    envelope=json.loads(path.read_text());envelope['capabilities']=['owner','shell','send']
+    path.write_text(json.dumps(envelope))
+    with pytest.raises(PermissionError):app.execute(principal,EVENT,client=source)
+    assert source.calls==[]
+
+
+def test_zoom_credential_scope_never_borrows_process_personal_or_default(principal,monkeypatch):
+    (principal.home/'.env').write_text('ZOOM_RESIDE_ACCOUNT_ID=wrong-account\n')
+    monkeypatch.setenv('ZOOM_RESIDE_ACCOUNT_ID',business.ZOOM_ACCOUNT)
+    client=business.BusinessClient(principal)
+    network=Mock(side_effect=AssertionError('no credential fallback'))
+    monkeypatch.setattr(client,'_request',network)
+    with pytest.raises(PermissionError):client.zoom('/users/webinars%40resideplatform.com')
+    network.assert_not_called()
+
+
+def test_v3_yaml_optin_is_literal_and_profile_local():
+    from plugins.platforms.discord.adapter import _apply_yaml_config
+    assert _apply_yaml_config({}, {'reside_scoped_ops_v3':True})['reside_scoped_ops_v3'] is True
+    assert 'reside_scoped_ops_v3' not in (_apply_yaml_config({}, {}) or {})
+    assert _apply_yaml_config({}, {'reside_scoped_ops_v3':'true'})['reside_scoped_ops_v3'] is not True
+
+
+def test_legacy_pinned_status_command_retains_original_read_only_broker(principal,monkeypatch):
+    from gateway import reside_assistant as v2
+    monkeypatch.setattr(v2,'profile_monday_token',lambda p:'exact-profile-token')
+    read=Mock(return_value='Pinned-three recorded statuses, not liveness')
+    monkeypatch.setattr(scope,'automation_report',read)
+    app.claim(principal,EVENT,'reside report')
+    assert app.execute(principal,EVENT)['body'].startswith('Pinned-three')
+    read.assert_called_once_with(principal,'exact-profile-token')
