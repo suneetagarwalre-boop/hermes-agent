@@ -7,7 +7,16 @@ BUSINESS_ZONE = ZoneInfo('America/Los_Angeles')
 _MONTHS = 'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?'
 _NAMED = re.compile(r'\b(' + _MONTHS + r')\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b', re.IGNORECASE)
 _MONTH_INDEX = {m: i for i, m in enumerate('jan feb mar apr may jun jul aug sep oct nov dec'.split(), 1)}
-_ISO = re.compile(r'\b\d{4}-\d{2}-\d{2}\b')
+_ISO = re.compile(r'(?<![\d/-])\b\d{4}-\d{2}-\d{2}\b(?![\d/-])')
+_US_DATE = re.compile(r'(?<![\d/])\b(\d{1,2})/(\d{1,2})/(\d{4})\b(?![\d/])')
+_RELATIVE = re.compile(r'\b(today|tomorrow|yesterday)\b', re.IGNORECASE)
+# This is a bounded selector grammar, not a natural-language date parser. Any
+# remaining calendar-like qualifier must clarify, never compete as title words.
+_TEMPORAL_RESIDUE = re.compile(
+    r'\b(?:' + _MONTHS + r'|Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|'
+    r'Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?|last|next|previous|before|after|since|until|'
+    r'ago|days?|weeks?|months?|years?|tonight|morning|afternoon|evening|night)\b|'
+    r'\b\d{4}\b|\b\d{1,4}[/.\-]\d{1,4}\b', re.IGNORECASE)
 _WORDS = re.compile(r'[a-z]{3,}')
 _STOP = set(('the for have has webinar registered registration registrations registrants people '
              'how many what which happening number count total october oct tomorrow today reside '
@@ -19,21 +28,42 @@ FOLLOWUP = re.compile(r'^(?:(?:and\s+)?(?:now|currently)|(?:how\s+many|what(?:\s
 
 
 def date_constraints(text, now):
-    """Return every constraint, not last-one-wins. Missing year stays unspecified."""
+    """Return every constraint; unsupported temporal syntax raises ValueError."""
+    return _date_parts(text, now)[0]
+
+
+def _date_parts(text, now):
+    """Parse and consume the same spans so ranking cannot erase restrictions.
+
+    Slash dates are US month/day/four-digit-year. Other numeric conventions,
+    incomplete dates and unsupported relative phrases require clarification.
+    """
     constraints = []
     today = datetime.fromisoformat(now).astimezone(BUSINESS_ZONE).date()
-    for word, offset in (('today', 0), ('tomorrow', 1)):
-        if re.search(r'\b' + word + r'\b', text, re.IGNORECASE):
-            d = today + timedelta(days=offset)
-            constraints.append((d.year, d.month, d.day))
-    for value in _ISO.findall(text):
-        d = date.fromisoformat(value)
-        constraints.append((d.year, d.month, d.day))
-    for month, day, year in _NAMED.findall(text):
-        m, d, y = _MONTH_INDEX[month[:3].lower()], int(day), int(year) if year else None
-        date(y or 2000, m, d)  # Validate even a date absent from the authorized inventory.
-        constraints.append((y, m, d))
-    return constraints
+
+    def consume(found):
+        value = found.group()
+        if found.re is _RELATIVE:
+            d = today + timedelta(days={'today': 0, 'tomorrow': 1, 'yesterday': -1}[value.lower()])
+            y, m, day = d.year, d.month, d.day
+        elif found.re is _ISO:
+            d = date.fromisoformat(value)
+            y, m, day = d.year, d.month, d.day
+        elif found.re is _US_DATE:
+            m, day, y = map(int, found.groups())
+        else:
+            month, day, year = found.groups()
+            m, day, y = _MONTH_INDEX[month[:3].lower()], int(day), int(year) if year else None
+        date(y if y is not None else 2000, m, day)
+        constraints.append((y, m, day))
+        return ' '
+
+    cleaned = text
+    for pattern in (_RELATIVE, _ISO, _US_DATE, _NAMED):
+        cleaned = pattern.sub(consume, cleaned)
+    if _TEMPORAL_RESIDUE.search(cleaned):
+        raise ValueError('unsupported temporal qualifier; clarify the event date')
+    return constraints, cleaned
 
 
 def event_day(start):
@@ -46,13 +76,12 @@ def event_day(start):
 def match(text, rows, now, fallback_id=None):
     """Intersect title, explicit IDs and ALL date constraints before selecting."""
     try:
-        constraints = date_constraints(text, now)
+        constraints, cleaned = _date_parts(text, now)
     except ValueError:
         return None
     ids = set(re.findall(r'\b\d{9,12}\b', text))
     if len(ids) > 1:
         return None
-    cleaned = _NAMED.sub(' ', _ISO.sub(' ', text))
     words = set(_WORDS.findall(cleaned.lower())) - _STOP
     # Rank independently over the full granted inventory so an ID cannot hide a
     # competing explicit title. A tie remains ambiguous until dates/ID intersect.
