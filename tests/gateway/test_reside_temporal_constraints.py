@@ -73,6 +73,31 @@ def test_partial_date_suffix_cannot_reuse_context(principal, source, selector, q
     assert_clarification(result, source)
 
 
+# Unspaced month/day syntax is unsupported, even when the day happens to match.
+UNSPACED_MONTH_DATES = [
+    month + suffix
+    for month in ('October', 'Oct')
+    for suffix in ('21', '22', '22-25')
+]
+
+
+@pytest.mark.parametrize('selector', [ID, TITLE])
+@pytest.mark.parametrize('qualifier', UNSPACED_MONTH_DATES)
+def test_unspaced_month_date_never_reads_totals(principal, source, selector, qualifier):
+    result = execute(principal, source, f'How many registrations for webinar {selector} {qualifier}?')
+    assert_clarification(result, source)
+
+
+@pytest.mark.parametrize('selector', [ID, TITLE])
+@pytest.mark.parametrize('qualifier', UNSPACED_MONTH_DATES)
+def test_unspaced_month_date_cannot_reuse_context(principal, source, selector, qualifier):
+    first = execute(principal, source, f'How many registrations for webinar {selector} today?')
+    assert first['aggregate']['id'] == ID
+    source.calls.clear()
+    result = execute(principal, source, f'How many now {qualifier}?', str(int(EVENT) + 1))
+    assert_clarification(result, source)
+
+
 @pytest.mark.parametrize('selector', [ID, TITLE])
 @pytest.mark.parametrize('qualifier,start', [
     ('10/22/2026', '2026-10-22T17:00:00Z'),
