@@ -10,6 +10,7 @@ _MONTH_INDEX = {m: i for i, m in enumerate('jan feb mar apr may jun jul aug sep 
 _ISO = re.compile(r'(?<![\d/-])\b\d{4}-\d{2}-\d{2}\b(?![\d/-])')
 _US_DATE = re.compile(r'(?<![\d/])\b(\d{1,2})/(\d{1,2})/(\d{4})\b(?![\d/])')
 _RELATIVE = re.compile(r'\b(today|tomorrow|yesterday)\b', re.IGNORECASE)
+_DATE_CONTINUATION = re.compile(r'\s*(?:[/.\-–]|\bto\b)\s*\d', re.IGNORECASE)
 # This is a bounded selector grammar, not a natural-language date parser. Any
 # remaining calendar-like qualifier must clarify, never compete as title words.
 _TEMPORAL_RESIDUE = re.compile(
@@ -42,6 +43,10 @@ def _date_parts(text, now):
     today = datetime.fromisoformat(now).astimezone(BUSINESS_ZONE).date()
 
     def consume(found):
+        # Check before erasing the supported prefix: "October 22-25" must
+        # not become a standalone date plus an otherwise harmless "-25".
+        if _DATE_CONTINUATION.match(found.string[found.end():]):
+            raise ValueError('unsupported temporal qualifier; clarify the event date')
         value = found.group()
         if found.re is _RELATIVE:
             d = today + timedelta(days={'today': 0, 'tomorrow': 1, 'yesterday': -1}[value.lower()])
