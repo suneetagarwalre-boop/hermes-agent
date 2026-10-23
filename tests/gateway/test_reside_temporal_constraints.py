@@ -52,7 +52,7 @@ def test_conflicting_common_dates_never_read_totals(principal, source, selector,
 PARTIAL_DATE_CONTINUATIONS = [
     prefix + separator + '23'
     for prefix in ('10/22/2026', '2026-10-22', 'October 22')
-    for separator in ('/', '.', '-', '–', ' to ', ' TO ', ' - ', ' – ')
+    for separator in ('/', '.', '-', '–', '—', ',', ' through ', ' to ', ' TO ', ' - ', ' – ')
 ] + ['October 22-25', 'Oct 22nd, 2026 . 23']
 
 
