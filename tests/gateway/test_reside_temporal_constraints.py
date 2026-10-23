@@ -48,9 +48,41 @@ def test_conflicting_common_dates_never_read_totals(principal, source, selector,
     assert_clarification(result, source)
 
 
+# A supported prefix must not erase an unsupported abbreviated date/range.
+PARTIAL_DATE_CONTINUATIONS = [
+    prefix + separator + '23'
+    for prefix in ('10/22/2026', '2026-10-22', 'October 22')
+    for separator in ('/', '.', '-', '–', ' to ', ' TO ', ' - ', ' – ')
+] + ['October 22-25', 'Oct 22nd, 2026 . 23']
+
+
+@pytest.mark.parametrize('selector', [ID, TITLE])
+@pytest.mark.parametrize('qualifier', PARTIAL_DATE_CONTINUATIONS)
+def test_partial_date_suffix_never_reads_totals(principal, source, selector, qualifier):
+    result = execute(principal, source, f'How many registrations for webinar {selector} {qualifier}?')
+    assert_clarification(result, source)
+
+
+@pytest.mark.parametrize('selector', [ID, TITLE])
+@pytest.mark.parametrize('qualifier', PARTIAL_DATE_CONTINUATIONS)
+def test_partial_date_suffix_cannot_reuse_context(principal, source, selector, qualifier):
+    first = execute(principal, source, f'How many registrations for webinar {selector} today?')
+    assert first['aggregate']['id'] == ID
+    source.calls.clear()
+    result = execute(principal, source, f'How many now {qualifier}?', str(int(EVENT) + 1))
+    assert_clarification(result, source)
+
+
 @pytest.mark.parametrize('selector', [ID, TITLE])
 @pytest.mark.parametrize('qualifier,start', [
     ('10/22/2026', '2026-10-22T17:00:00Z'),
+    ('2026-10-22', '2026-10-22T17:00:00Z'),
+    ('October 22', '2026-10-22T17:00:00Z'),
+    ('Oct 22nd, 2026', '2026-10-22T17:00:00Z'),
+    ('October 22 - please give the count', '2026-10-22T17:00:00Z'),
+    ('October 22. Please give the count', '2026-10-22T17:00:00Z'),
+    ('October 22, 2025', '2025-10-22T17:00:00Z'),
+    ('2025-10-22', '2025-10-22T17:00:00Z'),
     ('10/22/2026 today October 22 2026-10-22', '2026-10-22T17:00:00Z'),
     ('yesterday', '2026-10-21T17:00:00Z'),
     ('10/21/2026 yesterday', '2026-10-21T17:00:00Z'),
