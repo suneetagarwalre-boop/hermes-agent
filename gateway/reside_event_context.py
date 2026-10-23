@@ -14,6 +14,7 @@ _DATE_CONTINUATION = re.compile(r'\s*(?:[^\w\s]|\b(?:to|through)\b)\s*\d', re.IG
 # This is a bounded selector grammar, not a natural-language date parser. Any
 # remaining calendar-like qualifier must clarify, never compete as title words.
 _TEMPORAL_RESIDUE = re.compile(
+    r'\b(?:' + _MONTHS + r')(?=\d)|'
     r'\b(?:' + _MONTHS + r'|Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|'
     r'Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?|last|next|previous|before|after|since|until|'
     r'ago|days?|weeks?|months?|years?|tonight|morning|afternoon|evening|night)\b|'
