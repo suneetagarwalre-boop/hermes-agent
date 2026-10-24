@@ -1,0 +1,161 @@
+[
+  {
+    "id": "1BI21KdyXE-DnGic-Pa0pKRIP44-ilnRt0FLGa7ExsvM",
+    "name": "DRAFT \u2014 Reside Core One-Page Flyer (internal review)",
+    "parents": [
+      "0AD2hTrBPSH6tUk9PVA"
+    ],
+    "sha256": "b8c77d1b847a565cfeb2152eb446ac415bbca883d7664b55ba4e6cc27ac43158",
+    "owners": [
+      "suneet@suneetagarwal.com"
+    ],
+    "keywords": [
+      "core",
+      "draft",
+      "features",
+      "flyer",
+      "internal",
+      "offer",
+      "one",
+      "page",
+      "pricing",
+      "reside",
+      "review",
+      "solo",
+      "training"
+    ]
+  },
+  {
+    "id": "1dWh9KRZM9_dHs060zESWsuF9xSkchK-UEQwAY69bVYQ",
+    "name": "Reside ranking project \u2014 handoff to Jeff",
+    "parents": [
+      "0AD2hTrBPSH6tUk9PVA"
+    ],
+    "sha256": "7f156338439069f9605881c7abed821aa71c2fdad7423b42c0966378d8443f49",
+    "owners": [
+      "suneet@suneetagarwal.com"
+    ],
+    "keywords": [
+      "coaching",
+      "google",
+      "handoff",
+      "jeff",
+      "priorities",
+      "project",
+      "ranking",
+      "reside",
+      "search",
+      "seo",
+      "visibility"
+    ]
+  },
+  {
+    "id": "1FD_zOc4a9qFqIqsZSLmeuY7oYpK8NVYQFQUH6VwRP68",
+    "name": "Reside Search & AI Visibility Plan \u2014 resideplatform",
+    "parents": [
+      "0AD2hTrBPSH6tUk9PVA"
+    ],
+    "sha256": "5c8577e7c2cc98cf1120bc79400237de6572443791b193aec3f1cd3518741fe2",
+    "owners": [
+      "suneet@suneetagarwal.com"
+    ],
+    "keywords": [
+      "ai",
+      "baseline",
+      "clicks",
+      "google",
+      "marketing",
+      "plan",
+      "ranking",
+      "reside",
+      "resideplatform",
+      "search",
+      "seo",
+      "visibility"
+    ]
+  },
+  {
+    "id": "1Pdw3DIrDT9yhFkZPbB52mUk19XV3xHzDN-UVCWQVYSI",
+    "name": "SOP: Creating & Publishing New Webinars",
+    "parents": [
+      "1ezEXH6E5HZdQhuS0_xhmJ4_XouCOUrtx"
+    ],
+    "sha256": "03fbe1794b062ba009b4a408dbe2d89c74f44cb1412de70384af3241b4e90ba0",
+    "owners": [
+      "jeffrey@resideplatform.com"
+    ],
+    "keywords": [
+      "brand",
+      "branding",
+      "confirmation",
+      "creating",
+      "email",
+      "emails",
+      "followup",
+      "ghl",
+      "graphics",
+      "landing",
+      "new",
+      "page",
+      "publishing",
+      "registration",
+      "registrations",
+      "reminder",
+      "runbook",
+      "sop",
+      "webinar",
+      "webinars",
+      "zoom"
+    ]
+  },
+  {
+    "id": "1BUjPhQkrjTvuaFd8uqTvVp3GciACi_3ziu4YI4kaBs4",
+    "name": "SOP: Growth Stack Newsletter Process",
+    "parents": [
+      "15O8OFL-AHwgd8y0YLTOpiPnbExXQI-QA"
+    ],
+    "sha256": "a7af14ac95f68339fa6be6d929a4af7f358c3a1a594df77d98078433206a7cf1",
+    "owners": [
+      "jeffrey@resideplatform.com"
+    ],
+    "keywords": [
+      "cadence",
+      "email",
+      "font",
+      "formatting",
+      "ghl",
+      "growth",
+      "marketing",
+      "newsletter",
+      "process",
+      "qa",
+      "sop",
+      "stack"
+    ]
+  },
+  {
+    "id": "14EBz40cEMva6epEwsao-b_wwrGlbwQRm4TWxidI_Yz4",
+    "name": "SOP: Transitioning CORE Clients to FULL",
+    "parents": [
+      "1LuKIAG9fNPQEPpsDg_DVN10Q05qEYjWO"
+    ],
+    "sha256": "62a5c925cb0d9f53300fd93849705cc023aaaed4402d224e3b5ab8159d0bd883",
+    "owners": [
+      "jeffrey@resideplatform.com"
+    ],
+    "keywords": [
+      "agents",
+      "clients",
+      "contract",
+      "core",
+      "eligibility",
+      "full",
+      "onboarding",
+      "sop",
+      "team",
+      "teams",
+      "transition",
+      "transitioning"
+    ]
+  }
+]
