@@ -1780,6 +1780,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         return True, role_authorized
 
     def _is_reside_restricted_sender(self, user_id: str) -> bool:
+        # Suneet 2026-10-24: Jeff is chief admin. With discord.jeff_admin: true he skips the
+        # V3 sandbox and goes through the normal allowlist (he must also be in DISCORD_ALLOWED_USERS);
+        # his limits are set in SOUL.md. Flip it back to false to return him to V3.
+        if self.config.extra.get("jeff_admin") is True:
+            return False
         from gateway.reside_scope import restricted
         return restricted(getattr(self, "_reside_profile_home", None), user_id)
 
@@ -7646,7 +7651,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
     seeded_extra = {}
-    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops", "reside_scoped_ops_v2", "reside_scoped_ops_v3"):
+    for key in ("unprivileged_ack_channels", "mention_roster_path", "action_mentions", "recipient_contract", "reside_scoped_ops", "reside_scoped_ops_v2", "reside_scoped_ops_v3", "jeff_admin"):
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
     if "channel_response_policy" in discord_cfg:
