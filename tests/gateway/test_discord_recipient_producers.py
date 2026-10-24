@@ -100,3 +100,82 @@ async def test_real_final_extraction_and_ledger_boundary_preserve_contract(adapt
     assert channel.send.await_count==1
     assert channel.send.await_args.kwargs['content'].startswith(f'<@{JEFF}>\n')
     finalize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('declaration', ['[[discord-recipients:[]]]', '[[discord-recipients:["Jeff"]]]'])
+@pytest.mark.parametrize('body', ['', '\n \t\n'])
+async def test_empty_declared_final_is_silent_terminal_and_logged(adapter, caplog, declaration, body):
+    a, channel = adapter
+    for _ in range(2):
+        result = await a.send('555', declaration + body, reply_to='999', metadata={'notify': True})
+        assert not result.success  # Never claim that an empty reply was delivered.
+        assert 'requires a nonempty message' in result.error
+        assert a._send_retry_is_final(result)
+        assert not result.raw_response
+    channel.send.assert_not_awaited()
+    assert 'Suppressed empty Discord final' in caplog.text
+    assert 'source=999' in caplog.text
+    assert 'requires a nonempty message' in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('text, reason', [
+    ('Jeff needs to approve the draft.', 'Missing Discord recipient contract'),
+    ('[[discord-recipients:broken]]\nsecret body', 'one complete leading JSON declaration'),
+    ('[[discord-recipients:[broken]]]\nsecret body', 'Invalid Discord recipient contract JSON'),
+    ('[[discord-recipients:[1]]]\nsecret body', 'list of nonempty verified aliases or IDs'),
+    ('[[discord-recipients:["Unknown"]]]\nsecret body', 'Unresolved or ambiguous Discord recipient'),
+    # Invalid recipients must still fail closed, even when there is no body.
+    ('[[discord-recipients:["Unknown"]]]', 'Unresolved or ambiguous Discord recipient'),
+])
+async def test_failure_notice_reports_actual_validation_reason(adapter, text, reason):
+    a, channel = adapter
+    result = await a.send('555', text, reply_to='999', metadata={'notify': True})
+    assert not result.success
+    assert reason in result.error
+    channel.send.assert_awaited_once()
+    call = channel.send.await_args.kwargs
+    assert reason in call['content']
+    assert 'this message names someone' not in call['content']
+    assert 'secret body' not in call['content']
+    assert 'approve the draft' not in call['content']
+    assert call['allowed_mentions'].to_dict()['parse'] == []
+
+
+@pytest.mark.asyncio
+async def test_suppressed_recipient_notice_is_not_misreported_as_missing_routing(adapter):
+    a, channel = adapter
+    a.config.extra['allow_mentions'] = {'users': False}
+    result = await a.send('555', '[[discord-recipients:["Jeff"]]]\nsecret body', metadata={'notify': True})
+    assert not result.success
+    channel.send.assert_awaited_once()
+    assert 'notification suppressed by effective allowed_mentions' in channel.send.await_args.kwargs['content']
+
+
+@pytest.mark.asyncio
+async def test_empty_final_recovery_is_terminal_without_notice(adapter, monkeypatch, tmp_path):
+    from gateway import delivery_ledger as dl
+    from gateway.run_startup import GatewayStartupMixin
+    a, channel = adapter
+    monkeypatch.setattr(dl, '_db_path', lambda: tmp_path / 'ledger.db')
+    content = '[[discord-recipients:[]]]'
+    dl.record_obligation(obligation_id='empty-final', session_key='test', platform='discord',
+                         chat_id='555', thread_id=None, content=content,
+                         delivery_metadata={'notify': True, 'source_message_id': '999'})
+
+    class Runner(GatewayStartupMixin):
+        _obligation_adapter = AsyncMock(return_value=a)
+        _arm_flood_timers_for_waiting_rows = AsyncMock()
+
+    count = await Runner()._redeliver_claimed_obligations([
+        dict(obligation_id='empty-final', content=content, platform='discord', chat_id='555',
+             needs_marker=True, attempts=1)])
+    assert count == 0
+    channel.send.assert_not_awaited()
+    with dl._connect() as conn:
+        assert conn.execute('SELECT state FROM delivery_obligations').fetchone()[0] == 'refused'
+    assert dl.pending_retries() == []
+    assert dl.sweep_failed_for_runtime('discord') == []
+    monkeypatch.setattr(dl, '_owner_alive', lambda *args: False)
+    assert dl.sweep_recoverable() == []

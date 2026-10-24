@@ -17,6 +17,10 @@ class RecipientContractError(ValueError):
     """A logical message was withheld before recipient notification/delivery."""
 
 
+class EmptyDiscordMessageError(RecipientContractError):
+    """Valid routing with no visible body; suppress quietly, never bypass validation."""
+
+
 def declare_discord_recipients(text, recipients):
     """Serialize trusted producer routing, not names inferred from arbitrary prose."""
     if PREFIX in text:
@@ -91,7 +95,7 @@ def prepare_discord_message(text, extra, allowed, *, require_contract=False):
             raise RecipientContractError("Discord recipient notification suppressed by effective allowed_mentions")
         body = text[match.end():]
         if not body.strip():
-            raise RecipientContractError("Discord recipient contract requires a nonempty message")
+            raise EmptyDiscordMessageError("Discord recipient contract requires a nonempty message")
         # Only the header may notify. Preserve body references as inert text so
         # repeated/chunked references cannot notify a second time.
         for uid in resolved:

@@ -3469,7 +3469,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     def _send_retry_is_final(self, result):
         return str(getattr(result, "error", "") or "").startswith("discord_recipient_contract_refused:")
 
-    async def _recipient_failure_notice(self, chat_id, reply_to, metadata):
+    async def _recipient_failure_notice(self, chat_id, reply_to, metadata, reason):
         """Expose a withheld final without leaking its content or retry-spamming the source."""
         identity = (metadata or {}).get("delivery_id") or reply_to
         key = (str(chat_id), str(identity)) if identity else None
@@ -3485,16 +3485,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if key:
             seen[key] = None
         notice = await channel.send(
-            content="Reply delivery blocked: this message names someone but its recipient routing is "
-                    "missing or invalid, so it was withheld rather than guessed. The failure is logged "
-                    "for repair; there is no need to resend.",
+            # RecipientContractError reasons are validator-owned constants, not reply prose.
+            content=f"Reply delivery blocked: {reason}. No reply content was delivered. Details are logged.",
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=False))
         if key:
             seen[key] = str(notice.id)
             if len(seen) > 256:
                 seen.pop(next(iter(seen)))
-        logger.warning("[%s] Discord recipient contract blocked final source=%s notice=%s; no content delivered",
-                       self.name, reply_to, notice.id)
+        logger.warning("[%s] Discord recipient contract blocked final source=%s notice=%s reason=%s; no content delivered",
+                       self.name, reply_to, notice.id, reason)
         return str(notice.id)
 
     async def send(
@@ -3592,8 +3591,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
+            from plugins.platforms.discord.recipient_contract import EmptyDiscordMessageError, RecipientContractError
+            if isinstance(e, EmptyDiscordMessageError):
+                logger.warning("[%s] Suppressed empty Discord final source=%s chat=%s reason=%s; no notice sent",
+                               self.name, reply_to, chat_id, e)
+                # Terminal refusal keeps recovery/retries from replaying an empty final;
+                # success=False deliberately does not claim that a reply was delivered.
+                result = SendResult(success=False, error="discord_recipient_contract_refused:" + str(e))
+                return await self._record_response_async(
+                    reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            from plugins.platforms.discord.recipient_contract import RecipientContractError
             notice_id = None
             if isinstance(e, RecipientContractError) and (metadata is None or metadata.get("notify")):
                 import hashlib
@@ -3601,7 +3608,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 metadata.setdefault("delivery_id", hashlib.sha256(
                     (str(chat_id) + "|" + str(metadata.get("thread_id")) + "|" + content).encode()).hexdigest())
                 try:
-                    notice_id = await self._recipient_failure_notice(chat_id, reply_to, metadata)
+                    notice_id = await self._recipient_failure_notice(chat_id, reply_to, metadata, str(e))
                 except Exception:
                     logger.warning("[%s] Could not surface recipient delivery failure", self.name, exc_info=True)
             if _is_discord_transport_error(e):
