@@ -1,4 +1,14 @@
 """Dispatcher subprocess: submit one claim to its profile owner; never run an agent."""
+# `-m` puts the cwd (the card's workspace) first on sys.path, so a helper an agent left there named
+# like a stdlib module (t_ee550eb3 run 2283: queue.py) shadows it and kills this worker before it
+# reaches the owner. Hermes itself is pinned on PYTHONPATH by the dispatcher, so drop the cwd entry
+# unless the cwd is the Hermes tree.
+import os as _os
+import sys as _sys
+_cwd = _os.getcwd()
+if _cwd != _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))):
+    _sys.path[:] = [p for p in _sys.path if p not in ('', _cwd)]
+
 # Spawned as a bare ``sys.executable -m``: in a PM install that interpreter carries no dependencies
 # until hermes_bootstrap selects the committed environment, so it must be the first import.
 try:
