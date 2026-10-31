@@ -20,6 +20,8 @@ def inherit_creator_origin(
         (creator_task_id, task_id),
     )
     _inherit_notify_subs(conn, task_id, (creator_task_id,), created_at=created_at)
+    from tools.kanban_request_origin import stamp_task_origin
+    stamp_task_origin(conn, task_id, creator_task_id=creator_task_id)
 
 
 def initial_task_state(

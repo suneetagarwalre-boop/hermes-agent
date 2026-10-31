@@ -484,8 +484,8 @@ _GOAL_GATE_MESSAGES = {
 
 
 def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
-    """Goal-mode pre-handoff judge gate: a worker must not complete / request
-    review before acceptance criteria are met. ``blocked`` gets its own
+    """Goal-mode handoff gate: review readiness and final acceptance are distinct.
+    A review request cannot require its own future review. ``blocked`` gets its own
     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
     A broken judge fails open (logged) so it cannot permanently wedge work."""
     if not task or not task.goal_mode or not _goal_judge_available():
@@ -496,8 +496,11 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
+            phase_options: dict[str, Any] = (
+                {"evaluation_phase": "review"} if tool_name == "kanban_request_review" else {})
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip(),
+                **phase_options)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -628,6 +631,10 @@ def finalize_current_worker_from_env(
             if task.worker_pid is not None and int(task.worker_pid) != os.getpid():
                 return False
             if task.current_run_id != run_id:
+                return False
+            if kb._retry_status_for_run(conn, tid, run_id) == "review":
+                # A reviewer's quiet exit is not a verdict. Never turn it into
+                # approval or a review handoff back to the same reviewer.
                 return False
             text = (result_text or "").strip()
             note = (

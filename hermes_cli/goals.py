@@ -900,6 +900,7 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    evaluation_phase: str = "completion",
 ) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -907,6 +908,8 @@ def judge_goal(
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
     set ``transport_failed`` instead and fail-open to ``continue``.
     """
+    if evaluation_phase not in {"completion", "review"}:
+        raise ValueError(f"Unknown goal evaluation phase: {evaluation_phase!r}")
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
@@ -943,7 +946,21 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        system_prompt = JUDGE_SYSTEM_PROMPT
+        if evaluation_phase == "review":
+            system_prompt += (
+                "\n\nPHASE OVERRIDE: Evaluate REVIEW READINESS, not final goal completion. "
+                "This transition only hands a candidate to an independent reviewer; it does not "
+                "mark the task Done, approve the artifact, authorize activation, or waive any restriction. "
+                "Do not require the independent review, reviewer approval, or resulting rework "
+                "that this handoff is intended to initiate. Return done when a concrete reviewable "
+                "candidate and verification evidence exist, with known gaps honestly identified. "
+                "A bounded partial candidate can be reviewed without claiming the overall goal complete. "
+                "Return continue for a missing candidate, missing verification evidence, an unsupported "
+                "success claim, or a plan presented as implementation. Preserve all scope, account, "
+                "privacy, permission and no-send constraints. Final acceptance remains the reviewer's job."
+            )
+        raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.

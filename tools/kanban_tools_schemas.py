@@ -115,7 +115,10 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Free-form dict of structured facts about this "
                 "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
+                "workers alongside ``summary``. For a contracted task requiring review, "
+                "the reviewer must include review_outcome='approved', non-empty reviewer_checks "
+                "naming independent acceptance verification, and the matching contract scope fields. "
+                "Partial/unapproved work must use request_changes or block, not complete."
         )),
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "

@@ -1389,6 +1389,11 @@ def create_task(
                             {"reason": "parent_not_done", "parent": gating[0]},
                         )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                if not creator_task_id:
+                    # Only a newly inserted root gets its caller's provenance.
+                    # Idempotency hits return above; origin and task commit together.
+                    from tools.kanban_request_origin import stamp_task_origin
+                    stamp_task_origin(conn, task_id)
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -2720,20 +2725,32 @@ def _validate_goal_completion_contract(
             mismatches.append(f"{key}: expected {expected!r}, got {supplied.get(key)!r}")
     if mismatches:
         raise ValueError("task contract validation failed; " + "; ".join(mismatches))
-    if not contract.get("requires_review") or task.status == "review":
+    if not contract.get("requires_review"):
         return
-    if task.status == "running" and task.current_run_id is not None:
+    review_run = task.status == "review"
+    if not review_run and task.status == "running" and task.current_run_id is not None:
         run = conn.execute(
             "SELECT 1 FROM task_runs WHERE id=? AND task_id=? AND status='running' "
             "AND ended_at IS NULL",
             (task.current_run_id, task.id),
         ).fetchone()
         if run and _retry_status_for_run(conn, task.id, task.current_run_id) == "review":
-            return
-    raise ValueError(
-        "task contract requires independent review before completion; "
-        "use kanban_request_review, then have the reviewer approve it"
-    )
+            review_run = True
+    if not review_run:
+        raise ValueError(
+            "task contract requires independent review before completion; "
+            "use kanban_request_review, then have the reviewer approve it"
+        )
+    checks = supplied.get("reviewer_checks")
+    if (supplied.get("review_outcome") != "approved"
+            or not isinstance(checks, list) or not checks
+            or any(not isinstance(check, str) or not check.strip() for check in checks)
+            or supplied.get("overall_completion_approved") is False):
+        raise ValueError(
+            "task contract requires review approval evidence: metadata.review_outcome='approved' "
+            "and non-empty metadata.reviewer_checks describing independently verified acceptance. "
+            "A partial or unapproved deliverable must use request_changes or block, not complete."
+        )
 
 
 def complete_task(
@@ -4051,6 +4068,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    from tools.kanban_request_origin import render_task_origin
+    if origin_context := render_task_origin(conn, task_id):
+        lines.extend((origin_context, ""))
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
