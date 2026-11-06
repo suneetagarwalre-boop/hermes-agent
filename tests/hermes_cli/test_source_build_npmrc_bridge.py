@@ -30,6 +30,10 @@ def bridge(tmp_path, monkeypatch):
     user.mkdir()
     monkeypatch.setattr(Path, "home", lambda: user)
     monkeypatch.setattr(pm, "ensure", lambda name, *, base_env, **_: Runner(name, dict(base_env)))
+    # This test exercises npmrc bridging, not install provenance. A deployed source
+    # checkout can live directly under the operator's real Hermes root, where probing
+    # the adjacent payload manifest is correctly rejected by the test I/O guard.
+    monkeypatch.setattr("pm.environments.running_from_selected_environment", lambda root: False)
     return home
 
 

@@ -253,6 +253,12 @@ def test_a_swallowed_refusal_is_what_the_update_reports(tmp_path, monkeypatch, c
     from types import SimpleNamespace
 
     import hermes_cli.update_receipt as ur
+    import pm.environments as pm_environments
+
+    # Importing the CLI bootstraps dependency provenance. Keep this custody test
+    # independent of an adjacent live payload manifest when the checkout itself is
+    # installed under the operator's Hermes root.
+    monkeypatch.setattr(pm_environments, "payload_venv", lambda root: None)
     from hermes_cli import main, update_cmd, update_custody, update_owning_install
 
     monkeypatch.setattr(update_custody, "_RUN", {"ran": False, "refused": None})
