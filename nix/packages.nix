@@ -103,6 +103,8 @@
         # lives in nix/pnpm-deps-hash (`nix run .#update-pnpm-lockfile`).
         pnpm-deps = full.hermesNpmLib.pnpmDeps;
         update-pnpm-lockfile = full.hermesNpmLib.updatePnpmLockfile;
+        # Compatibility alias for existing automation during the npm-to-pnpm migration.
+        fix-lockfiles = full.hermesNpmLib.updatePnpmLockfile;
       }
       # Every pm lockfile tool as its own installable derivation:
       # `nix build .#pm-ripgrep`, `nix build .#pm-gh`, ...
