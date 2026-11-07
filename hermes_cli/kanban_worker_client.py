@@ -14,7 +14,7 @@ if _cwd != _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))):
 try:
     import hermes_bootstrap
 except ModuleNotFoundError as exc:
-    if exc.name != "hermes_bootstrap":
+    if exc.name != "hermes_bootstrap" and not "hermes_bootstrap".startswith(f"{exc.name}."):
         raise
 
 import asyncio
