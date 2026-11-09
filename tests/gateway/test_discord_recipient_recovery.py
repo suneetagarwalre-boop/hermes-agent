@@ -83,24 +83,36 @@ def test_terminal_refusal_is_not_automatically_backfilled_or_marked_delivered(ad
     assert tuple(row)==('refused',0)
 
 @pytest.mark.parametrize('strict',[True,False])
-def test_real_gateway_turn_refreshes_cached_producer_policy(adapter,monkeypatch,strict):
+@pytest.mark.parametrize('observed',[None, 'Observed room context'])
+@pytest.mark.parametrize('raises',[False, True])
+def test_real_gateway_turn_refreshes_cached_producer_policy(adapter,monkeypatch,strict,observed,raises):
     from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
     a, _=adapter
     a.config.extra['recipient_contract']=strict
-    ctx=SimpleNamespace(session_key='test',session_id='restored',source=SimpleNamespace(user_id='owner',user_name='Owner'),
-        persist_user_display_kind=None,persist_user_display_metadata=None,moa_config=None,
-        inbound_message_id=None,mute_notification_reply=False,title_user_message=None)
+    message='Internal Kanban result handoff for Jeff.'
+    ctx=TurnContext(session_key='test',session_id='restored',message=message,
+        source=SimpleNamespace(user_id='owner',user_name='Owner'))
     tr=TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source:a),ctx)
-    monkeypatch.setattr(tr,'_native_image_run_message',lambda:'Internal Kanban result handoff for Jeff.')
+    monkeypatch.setattr(tr,'_native_image_run_message',lambda:message)
     seen=[]
     class Agent:
         ephemeral_system_prompt='Original ephemeral policy'
         _cached_system_prompt='OLD cached prompt WITHOUT transport metadata'
-        def run_conversation(self,message,**kwargs):
+        def run_conversation(self,api_message,**kwargs):
             seen.append(self.ephemeral_system_prompt)
+            if observed:
+                assert api_message != message
+                assert kwargs['persist_user_message'] == message
+            if raises:
+                raise RuntimeError('model canary failure')
             return {'final_response':'test'}
     agent=Agent()
-    tr._run_conversation_with_approval(agent,[],None,None,None)
+    if raises:
+        with pytest.raises(RuntimeError, match='model canary failure'):
+            tr._run_conversation_with_approval(agent,[],observed,None,None)
+    else:
+        tr._run_conversation_with_approval(agent,[],observed,None,None)
     assert ('discord-recipients' in seen[0]) is strict
     assert agent.ephemeral_system_prompt=='Original ephemeral policy'
     assert agent._cached_system_prompt=='OLD cached prompt WITHOUT transport metadata'
