@@ -30,8 +30,9 @@ def test_observed_context_native_image_turn_persists_clean_multimodal_message(mo
         session_key="telegram:session-1",
         source=SimpleNamespace(user_id="user-1", user_name="Example", is_bot=False),
     )
-    runner = object.__new__(TurnRunner)
-    runner._ctx = ctx
+    # Exercise the production constructor: transport policy resolves through the
+    # owning gateway even for Telegram turns without a delivery adapter.
+    runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: None), ctx)
     monkeypatch.setattr(runner, "_native_image_run_message", lambda: native_message)
 
     # Production always hands a clean str override (the timestamp-strip path), so the native list must win.
@@ -61,8 +62,9 @@ def test_observed_context_native_image_turn_persists_clean_override_with_image_h
         session_key="telegram:session-1",
         source=SimpleNamespace(user_id="user-1", user_name="Example", is_bot=False),
     )
-    runner = object.__new__(TurnRunner)
-    runner._ctx = ctx
+    # Exercise the production constructor: transport policy resolves through the
+    # owning gateway even for Telegram turns without a delivery adapter.
+    runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: None), ctx)
     monkeypatch.setattr(runner, "_native_image_run_message", lambda: native_message)
 
     runner._run_conversation_with_approval(Agent(), [], "earlier group chatter", "What is in this image?", None)
@@ -95,8 +97,9 @@ def test_observed_context_native_image_turn_keeps_pre_wrap_list_without_matching
         session_key="telegram:session-1",
         source=SimpleNamespace(user_id="user-1", user_name="Example", is_bot=False),
     )
-    runner = object.__new__(TurnRunner)
-    runner._ctx = ctx
+    # Exercise the production constructor: transport policy resolves through the
+    # owning gateway even for Telegram turns without a delivery adapter.
+    runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: None), ctx)
     monkeypatch.setattr(runner, "_native_image_run_message", lambda: native_message)
 
     runner._run_conversation_with_approval(Agent(), [], "earlier group chatter", override, None)
