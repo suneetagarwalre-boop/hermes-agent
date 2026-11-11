@@ -1798,6 +1798,22 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
+
+def _final_delivery_metadata(event, session_key: str, text_content: str,
+                             metadata: Optional[dict], reply_to: Optional[str]) -> dict:
+    """Metadata every ledgered final carries (cd4a1a91e2): a stable ``delivery_id`` lets the
+    platform dedupe a redelivered final; ``notify`` and ``source_message_id`` ride the ledger row
+    so a boot/timed redelivery replays them and completes the source message."""
+    from gateway.delivery_ledger import compute_obligation_id
+    metadata = dict(metadata or {})
+    metadata.setdefault("delivery_id", compute_obligation_id(
+        session_key, str(getattr(event, "ledger_message_id", None) or event.message_id or ""), text_content))
+    metadata["notify"] = True
+    if reply_to:
+        metadata.setdefault("source_message_id", str(reply_to))
+    return metadata
+
+
 class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
@@ -4224,15 +4240,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        from gateway.delivery_ledger import compute_obligation_id
-        # Stable delivery_id lets the platform side dedupe a redelivered final; notify and the
-        # source message ride the ledger row so a redelivery replays them (cd4a1a91e2).
-        metadata = dict(metadata or {})
-        metadata.setdefault("delivery_id", compute_obligation_id(
-            session_key, str(getattr(event, "ledger_message_id", None) or event.message_id or ""), text_content))
-        metadata["notify"] = True
-        if reply_to:
-            metadata.setdefault("source_message_id", str(reply_to))
+        metadata = _final_delivery_metadata(event, session_key, text_content, metadata, reply_to)
 
         async def _send(delivery_adapter: "BasePlatformAdapter", obligation_id: Optional[str]) -> SendResult:
             logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
@@ -4262,7 +4270,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 logger.warning("Final for session %s may not have landed; the delivery ledger "
                                "redelivers it with the duplicate marker", session_key)
             return SendResult(success=False, error=error)
-        await ledger_bracket(self, event, session_key, text, _attempted)
+        # Same metadata as send_final_ledgered, so the replay answers (and completes) the source.
+        metadata = _final_delivery_metadata(event, session_key, text, None, _reply_anchor_for_event(event))
+        await ledger_bracket(self, event, session_key, text, _attempted, delivery_metadata=metadata)
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
         """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or

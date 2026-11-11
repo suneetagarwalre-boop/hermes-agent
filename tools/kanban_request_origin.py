@@ -38,8 +38,15 @@ def stamp_task_origin(conn, task_id, *, creator_task_id=None):
         origin = task_origin(conn, creator_task_id)
     elif bound_session_key():
         origin = {"version": 1, **{key: get_bound_session_env("HERMES_SESSION_" + env, "") for key, env in (
-            ("platform", "PLATFORM"), ("user_id", "USER_ID"), ("session_id", "ID"),
+            ("platform", "PLATFORM"), ("session_id", "ID"),
             ("message_id", "MESSAGE_ID"), ("profile", "PROFILE"), ("chat_id", "CHAT_ID"))}}
+        # The originating principal is the bound ACTOR, not the routing user. An actor bound to
+        # "" (another sender joined the turn) means no single requester: leave the origin unknown
+        # rather than attribute the card to the route. Only a path that never binds an actor
+        # falls back to the routing user id.
+        unbound = object()
+        actor = get_bound_session_env("HERMES_SESSION_ACTOR_ID", unbound)
+        origin["user_id"] = get_bound_session_env("HERMES_SESSION_USER_ID", "") if actor is unbound else actor
         if not all(isinstance(origin.get(k), str) and origin[k].strip() for k in ("platform", "user_id", "session_id")):
             return
     else:
