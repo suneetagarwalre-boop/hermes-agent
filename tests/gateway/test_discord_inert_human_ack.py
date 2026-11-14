@@ -97,6 +97,20 @@ async def test_no_loops_or_other_profile_expansion(scoped, case):
     scoped.handle_message.assert_not_awaited()
 
 @pytest.mark.asyncio
+async def test_flagless_webhook_never_receives_human_ack(scoped, monkeypatch):
+    monkeypatch.setenv('DISCORD_ALLOW_BOTS', 'none')
+    assert 'channel_response_policy' not in scoped.config.extra
+    m = message(scoped, uid='424242424242424242', bot=False)
+    m.webhook_id = 424242424242424242
+    scoped._handle_message = AsyncMock()
+
+    assert await scoped._dispatch_discord_message(m) is False
+    m.channel.send.assert_not_called()
+    scoped._handle_message.assert_not_awaited()
+    scoped.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_failed_ack_does_not_retry_or_invoke_agent(scoped):
     m = message(scoped)
     m.channel.send.side_effect = RuntimeError('network failure')

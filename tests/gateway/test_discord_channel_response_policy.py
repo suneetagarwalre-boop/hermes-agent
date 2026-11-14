@@ -63,6 +63,22 @@ async def test_live_ingress_trigger_matrix(scoped, text, author, bot, ping, want
     assert await scoped._dispatch_discord_message(m) is want
     assert scoped.handle_message.await_count == int(want)
 
+@pytest.mark.parametrize('author,text,ping,want', [
+    (PEER, '@SELF webhook update', False, True),
+    ('1511511765203026110', '@SELF webhook update', False, False),
+    (PEER, 'reply chip only', True, False),
+    (OWNER, 'Pryor, help', False, False),
+])
+@pytest.mark.asyncio
+async def test_flagless_webhooks_obey_room_bot_policy(scoped, author, text, ping, want):
+    message = msg(scoped, text, author=author, ping=ping)
+    del message.author.bot
+    message.webhook_id = int(author)
+    assert scoped._channel_response_addressed(message) is want
+    assert await scoped._dispatch_discord_message(message) is want
+    assert scoped.handle_message.await_count == int(want)
+
+
 @pytest.mark.asyncio
 async def test_participated_thread_not_ambient(scoped):
     thread = FakeThread(channel_id=999, parent=FakeTextChannel(channel_id=int(ROOM)))
